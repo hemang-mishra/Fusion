@@ -60,68 +60,59 @@ from applications.placement_cell.api.serializers import (
     PlacementPolicySerializer,
 )
 
-from applications.placement_cell.utils import (
-    check_eligibility, check_duplicate_application,
-    check_placement_policy, get_placement_statistics,
-    get_student_application_summary, expire_pending_offers,
+# Import business logic services
+from applications.placement_cell.services import (
+    is_tpo_or_chairman, is_chairman, is_officer, is_student, get_student, get_user_roles,
+    check_invitation_date, create_placement_schedule, update_student_invitation,
+    delete_placement_schedule, get_all_students_with_placement_info, get_student_cv_data,
+    build_cv_context, get_placement_status_list, update_student_placement_status,
+    get_placement_records, get_placement_year_statistics, get_student_records,
+    get_debarred_students, debar_student, undebar_student, get_student_debar_status,
+    register_company, get_all_companies, check_eligibility, check_duplicate_application,
+    check_placement_policy, create_job_application, update_job_application_status,
+    process_offer_response, expire_pending_offers, get_placement_statistics,
+    get_student_application_summary, get_placement_report_data, get_interview_schedules,
+    create_interview_schedule, get_interview_details, get_placement_policies,
+    create_or_update_policy, toggle_policy_active, get_all_roles, create_or_get_role,
+    get_form_field_config, get_active_announcements,
 )
+
 
 logger = logging.getLogger('django.server')
 
 
 # =============================================
-# HELPER FUNCTIONS
+# HELPER FUNCTIONS (Backwards compatibility)
 # =============================================
 
 def _is_tpo_or_chairman(user):
     """Check if user is TPO or Placement Chairman."""
-    return HoldsDesignation.objects.filter(
-        Q(working=user, designation__name="placement officer") |
-        Q(working=user, designation__name="placement chairman")
-    ).exists()
+    return is_tpo_or_chairman(user)
 
 
 def _is_chairman(user):
     """Check if user is Placement Chairman."""
-    return HoldsDesignation.objects.filter(
-        Q(working=user, designation__name="placement chairman")
-    ).exists()
+    return is_chairman(user)
 
 
 def _is_officer(user):
     """Check if user is Placement Officer (TPO)."""
-    return HoldsDesignation.objects.filter(
-        Q(working=user, designation__name="placement officer")
-    ).exists()
+    return is_officer(user)
 
 
 def _is_student(user):
     """Check if user is a student."""
-    return HoldsDesignation.objects.filter(
-        Q(working=user, designation__name="student")
-    ).exists()
+    return is_student(user)
 
 
 def _get_student(user):
     """Get the Student object for a user. Returns None if not a student."""
-    try:
-        profile = ExtraInfo.objects.get(user=user)
-        return Student.objects.get(id=profile)
-    except (ExtraInfo.DoesNotExist, Student.DoesNotExist):
-        return None
+    return get_student(user)
 
 
 def _check_invitation_date(placementstatus_qs):
     """Expire pending invitations past their deadline."""
-    try:
-        for ps in placementstatus_qs:
-            if ps.invitation == 'PENDING':
-                dt = ps.timestamp + datetime.timedelta(days=ps.no_of_days)
-                if dt < datetime.datetime.now():
-                    ps.invitation = 'IGNORE'
-                    ps.save()
-    except Exception as e:
-        logger.error('Error checking invitation date: {}'.format(e))
+    return check_invitation_date(placementstatus_qs)
 
 
 # =============================================
@@ -133,25 +124,7 @@ def _check_invitation_date(placementstatus_qs):
 @authentication_classes([TokenAuthentication])
 def user_roles_api(request):
     """Return the user's placement roles."""
-    user = request.user
-    is_chairman_val = _is_chairman(user)
-    is_officer_val = _is_officer(user)
-    is_student_val = _is_student(user)
-
-    role = 'other'
-    if is_chairman_val:
-        role = 'placement chairman'
-    elif is_officer_val:
-        role = 'placement officer'
-    elif is_student_val:
-        role = 'student'
-
-    return Response({
-        'role': role,
-        'is_chairman': is_chairman_val,
-        'is_officer': is_officer_val,
-        'is_student': is_student_val,
-    })
+    return Response(get_user_roles(request.user))
 
 
 # =============================================
@@ -174,8 +147,8 @@ def placement_schedule_api(request):
         data = PlacementScheduleSerializer(schedules, many=True).data
 
         # For students, attach invitation status
-        if _is_student(user):
-            student = _get_student(user)
+        if is_student(user):
+            student = get_student(user)
             if student:
                 for item in data:
                     try:
@@ -188,7 +161,7 @@ def placement_schedule_api(request):
         return Response(data)
 
     elif request.method == 'POST':
-        if not _is_tpo_or_chairman(user):
+        if not is_tpo_or_chairman(user):
             return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
 
         company_name = request.data.get('company_name', '')
@@ -202,32 +175,9 @@ def placement_schedule_api(request):
         schedule_at = request.data.get('schedule_at')
         attached_file = request.FILES.get('attached_file')
 
-        # Ensure CompanyDetails exists
-        CompanyDetails.objects.get_or_create(company_name=company_name)
-
-        # Ensure Role exists
-        role_obj, _ = Role.objects.get_or_create(role=role_offered)
-
-        # Create notification
-        notify = NotifyStudent.objects.create(
-            placement_type=placement_type,
-            company_name=company_name,
-            description=description,
-            ctc=ctc,
-            timestamp=timezone.now(),
-        )
-
-        # Create schedule
-        schedule = PlacementSchedule.objects.create(
-            notify_id=notify,
-            title=company_name,
-            description=description,
-            placement_date=placement_date,
-            attached_file=attached_file,
-            role=role_obj,
-            location=location,
-            time=time_val,
-            schedule_at=schedule_at or timezone.now(),
+        schedule = create_placement_schedule(
+            company_name, placement_date, location, ctc, time_val,
+            placement_type, role_offered, description, schedule_at, attached_file
         )
 
         return Response(
@@ -248,43 +198,27 @@ def placement_schedule_detail_api(request, schedule_id):
 
     if request.method == 'PUT':
         # Student updating invitation status
-        student = _get_student(user)
+        student = get_student(user)
         if not student:
             return Response({'error': 'Student profile not found'}, status=status.HTTP_404_NOT_FOUND)
 
         schedule = get_object_or_404(PlacementSchedule, id=schedule_id)
         invitation_action = request.data.get('invitation', '')
 
-        try:
-            ps = PlacementStatus.objects.get(
-                unique_id=student, notify_id=schedule.notify_id
-            )
-        except PlacementStatus.DoesNotExist:
-            ps = PlacementStatus.objects.create(
-                unique_id=student,
-                notify_id=schedule.notify_id,
-                invitation='PENDING',
-            )
-
-        if invitation_action in ('ACCEPTED', 'REJECTED'):
-            ps.invitation = invitation_action
-            ps.timestamp = timezone.now()
-            ps.save()
+        ps = update_student_invitation(student, schedule, invitation_action)
+        if ps:
             return Response({'status': ps.invitation})
 
         return Response({'error': 'Invalid action. Use ACCEPTED or REJECTED.'}, status=status.HTTP_400_BAD_REQUEST)
 
     elif request.method == 'DELETE':
-        if not _is_tpo_or_chairman(user):
+        if not is_tpo_or_chairman(user):
             return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
 
         schedule = get_object_or_404(PlacementSchedule, id=schedule_id)
-        try:
-            schedule.notify_id.delete()  # Cascades to PlacementStatus
-            schedule.delete()
+        if delete_placement_schedule(schedule):
             return Response({'status': 'deleted'})
-        except Exception as e:
-            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return Response({'error': 'Failed to delete'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 # =============================================
@@ -296,30 +230,7 @@ def placement_schedule_detail_api(request, schedule_id):
 @authentication_classes([TokenAuthentication])
 def student_records_api(request):
     """List all students with profile/placement info."""
-    students = Student.objects.select_related('id', 'id__user', 'id__department').all()
-
-    data = []
-    for student in students:
-        try:
-            sp = StudentPlacement.objects.get(unique_id=student)
-            debar = sp.debar
-            placed = sp.placed_type
-        except StudentPlacement.DoesNotExist:
-            debar = 'NOT DEBAR'
-            placed = 'NOT PLACED'
-
-        data.append({
-            'id': student.id.id,
-            'name': '{} {}'.format(student.id.user.first_name, student.id.user.last_name),
-            'roll_no': student.id.id,
-            'department': student.id.department.name if student.id.department else '',
-            'programme': student.programme or '',
-            'batch': student.batch,
-            'cpi': student.cpi,
-            'debar': debar,
-            'placed': placed,
-        })
-
+    data = get_all_students_with_placement_info()
     return Response(data)
 
 
@@ -329,54 +240,29 @@ def student_records_api(request):
 def cv_data_api(request, username):
     """Get student CV data as JSON."""
     target_user = get_object_or_404(User, username=username)
-    profile = get_object_or_404(ExtraInfo, user=target_user)
-    student = get_object_or_404(Student, id=profile)
+    cv_data = get_student_cv_data(target_user)
 
-    skills = Has.objects.select_related('skill_id').filter(unique_id=student)
-    education = Education.objects.filter(unique_id=student)
-    references = Reference.objects.filter(unique_id=student)
-    courses = Course.objects.filter(unique_id=student)
-    experiences = Experience.objects.filter(unique_id=student)
-    projects = Project.objects.filter(unique_id=student)
-    achievements = Achievement.objects.filter(unique_id=student)
-    extracurriculars = Extracurricular.objects.filter(unique_id=student)
-    conferences = Conference.objects.filter(unique_id=student)
-    publications = Publication.objects.filter(unique_id=student)
-    patents = Patent.objects.filter(unique_id=student)
+    # Serialize querysets to dicts
+    from applications.placement_cell.api.serializers import (
+        HasSerializer, EducationSerializer, ReferenceSerializer,
+        CourseSerializer, ExperienceSerializer, ProjectSerializer,
+        AchievementSerializer, ExtracurricularSerializer,
+        ConferenceSerializer, PublicationSerializer, PatentSerializer
+    )
 
-    return Response({
-        'user': {
-            'username': target_user.username,
-            'first_name': target_user.first_name,
-            'last_name': target_user.last_name,
-            'email': target_user.email,
-        },
-        'profile': {
-            'about_me': profile.about_me or '',
-            'age': profile.age if hasattr(profile, 'age') else None,
-            'address': profile.address or '',
-            'phone_no': profile.phone_no or '',
-            'department': profile.department.name if profile.department else '',
-            'profile_picture': profile.profile_picture.url if profile.profile_picture else None,
-        },
-        'student': {
-            'programme': student.programme or '',
-            'batch': student.batch,
-            'cpi': student.cpi,
-            'specialization': student.specialization or '',
-        },
-        'skills': HasSerializer(skills, many=True).data,
-        'education': EducationSerializer(education, many=True).data,
-        'references': ReferenceSerializer(references, many=True).data,
-        'courses': CourseSerializer(courses, many=True).data,
-        'experiences': ExperienceSerializer(experiences, many=True).data,
-        'projects': ProjectSerializer(projects, many=True).data,
-        'achievements': AchievementSerializer(achievements, many=True).data,
-        'extracurriculars': ExtracurricularSerializer(extracurriculars, many=True).data,
-        'conferences': ConferenceSerializer(conferences, many=True).data,
-        'publications': PublicationSerializer(publications, many=True).data,
-        'patents': PatentSerializer(patents, many=True).data,
-    })
+    cv_data['skills'] = HasSerializer(cv_data['skills'], many=True).data
+    cv_data['education'] = EducationSerializer(cv_data['education'], many=True).data
+    cv_data['references'] = ReferenceSerializer(cv_data['references'], many=True).data
+    cv_data['courses'] = CourseSerializer(cv_data['courses'], many=True).data
+    cv_data['experiences'] = ExperienceSerializer(cv_data['experiences'], many=True).data
+    cv_data['projects'] = ProjectSerializer(cv_data['projects'], many=True).data
+    cv_data['achievements'] = AchievementSerializer(cv_data['achievements'], many=True).data
+    cv_data['extracurriculars'] = ExtracurricularSerializer(cv_data['extracurriculars'], many=True).data
+    cv_data['conferences'] = ConferenceSerializer(cv_data['conferences'], many=True).data
+    cv_data['publications'] = PublicationSerializer(cv_data['publications'], many=True).data
+    cv_data['patents'] = PatentSerializer(cv_data['patents'], many=True).data
+
+    return Response(cv_data)
 
 
 @api_view(['POST'])
@@ -389,10 +275,7 @@ def generate_cv_api(request):
 
     username = request.data.get('username', request.user.username)
     target_user = get_object_or_404(User, username=username)
-    profile = get_object_or_404(ExtraInfo, user=target_user)
-    student = get_object_or_404(Student, id=profile)
 
-    # Which sections to include (default all)
     achievementcheck = request.data.get('achievementcheck', '1')
     educationcheck = request.data.get('educationcheck', '1')
     publicationcheck = request.data.get('publicationcheck', '1')
@@ -405,54 +288,11 @@ def generate_cv_api(request):
     conferencecheck = request.data.get('conferencecheck', '1')
     reference_list = request.data.getlist('reference_checkbox_list', [])
 
-    skills = Has.objects.select_related('skill_id').filter(unique_id=student)
-    education = Education.objects.filter(unique_id=student)
-    references = Reference.objects.filter(id__in=reference_list) if reference_list else Reference.objects.none()
-    courses = Course.objects.filter(unique_id=student)
-    experiences = Experience.objects.filter(unique_id=student)
-    projects = Project.objects.filter(unique_id=student)
-    achievements = Achievement.objects.filter(unique_id=student)
-    extracurriculars = Extracurricular.objects.filter(unique_id=student)
-    conferences = Conference.objects.filter(unique_id=student)
-    publications = Publication.objects.filter(unique_id=student)
-    patents = Patent.objects.filter(unique_id=student)
-
-    student_info = get_object_or_404(Student, id=target_user.username)
-    batch = student_info.batch
-    now = datetime.datetime.now()
-    roll = min(now.year - batch, 4) if now.year - batch <= 4 else 4
-
-    referencecheck = '1' if references.exists() else '0'
-
-    context = {
-        'pagesize': 'A4',
-        'user': target_user,
-        'profile': profile,
-        'projects': projects,
-        'skills': skills,
-        'educations': education,
-        'references': references,
-        'courses': courses,
-        'experiences': experiences,
-        'achievements': achievements,
-        'extracurriculars': extracurriculars,
-        'publications': publications,
-        'patents': patents,
-        'conferences': conferences,
-        'roll': roll,
-        'referencecheck': referencecheck,
-        'achievementcheck': achievementcheck,
-        'educationcheck': educationcheck,
-        'publicationcheck': publicationcheck,
-        'patentcheck': patentcheck,
-        'internshipcheck': internshipcheck,
-        'projectcheck': projectcheck,
-        'coursecheck': coursecheck,
-        'skillcheck': skillcheck,
-        'extracurricularcheck': extracurricularcheck,
-        'conferencecheck': conferencecheck,
-        'today': datetime.date.today(),
-    }
+    context = build_cv_context(
+        target_user, achievementcheck, educationcheck, publicationcheck,
+        patentcheck, internshipcheck, projectcheck, coursecheck,
+        skillcheck, extracurricularcheck, conferencecheck, reference_list
+    )
 
     html = render_to_string('placementModule/cv.html', context)
     result = BytesIO()
@@ -473,13 +313,10 @@ def generate_cv_api(request):
 @authentication_classes([TokenAuthentication])
 def student_applications_api(request, job_id):
     """Get students who applied/were invited for a specific placement schedule."""
-    if not _is_tpo_or_chairman(request.user):
+    if not is_tpo_or_chairman(request.user):
         return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
 
-    statuses = PlacementStatus.objects.select_related(
-        'unique_id', 'unique_id__id', 'unique_id__id__user', 'notify_id'
-    ).filter(notify_id=job_id)
-
+    statuses = get_placement_status_list(notify_id=job_id)
     return Response(PlacementStatusSerializer(statuses, many=True).data)
 
 
@@ -565,39 +402,9 @@ def placement_statistics_api(request):
         year = request.query_params.get('year', '')
         name = request.query_params.get('name', '')
 
-        qs = PlacementRecord.objects.all()
-        if placement_type:
-            qs = qs.filter(placement_type=placement_type)
-        if year:
-            qs = qs.filter(year=year)
-        if name:
-            qs = qs.filter(name__icontains=name)
-
-        data = PlacementRecordSerializer(qs.order_by('-year'), many=True).data
-
-        # Add department-wise counts per year
-        years = PlacementRecord.objects.filter(
-            ~Q(placement_type="HIGHER STUDIES")
-        ).values('year').annotate(Count('year')).order_by('-year')
-
-        year_stats = []
-        for y in years:
-            student_records = StudentRecord.objects.select_related(
-                'unique_id__id__department', 'record_id'
-            ).filter(record_id__year=y['year'])
-
-            cse = student_records.filter(unique_id__id__department__name='CSE').count()
-            ece = student_records.filter(unique_id__id__department__name='ECE').count()
-            me = student_records.filter(unique_id__id__department__name='ME').count()
-            total = cse + ece + me
-
-            year_stats.append({
-                'year': y['year'],
-                'total': total,
-                'cse': cse,
-                'ece': ece,
-                'me': me,
-            })
+        records = get_placement_records(placement_type, year, name)
+        data = PlacementRecordSerializer(records, many=True).data
+        year_stats = get_placement_year_statistics()
 
         return Response({
             'records': data,
@@ -605,7 +412,7 @@ def placement_statistics_api(request):
         })
 
     elif request.method == 'POST':
-        if not _is_tpo_or_chairman(request.user):
+        if not is_tpo_or_chairman(request.user):
             return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
 
         serializer = PlacementRecordSerializer(data=request.data)
@@ -615,7 +422,7 @@ def placement_statistics_api(request):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
     elif request.method == 'DELETE':
-        if not _is_tpo_or_chairman(request.user):
+        if not is_tpo_or_chairman(request.user):
             return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
 
         record_id = request.data.get('record_id')
@@ -639,26 +446,15 @@ def manage_records_api(request):
     DELETE: Remove a student record.
     """
     if request.method == 'GET':
-        qs = StudentRecord.objects.select_related(
-            'unique_id', 'unique_id__id', 'unique_id__id__user',
-            'unique_id__id__department', 'record_id'
-        ).all()
-
         placement_type = request.query_params.get('placement_type', '')
         year = request.query_params.get('year', '')
         company = request.query_params.get('company', '')
 
-        if placement_type:
-            qs = qs.filter(record_id__placement_type=placement_type)
-        if year:
-            qs = qs.filter(record_id__year=year)
-        if company:
-            qs = qs.filter(record_id__name__icontains=company)
-
-        return Response(StudentRecordSerializer(qs, many=True).data)
+        records = get_student_records(placement_type, year, company)
+        return Response(StudentRecordSerializer(records, many=True).data)
 
     elif request.method == 'POST':
-        if not _is_tpo_or_chairman(request.user):
+        if not is_tpo_or_chairman(request.user):
             return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
 
         serializer = StudentRecordSerializer(data=request.data)
@@ -668,7 +464,7 @@ def manage_records_api(request):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
     elif request.method == 'DELETE':
-        if not _is_tpo_or_chairman(request.user):
+        if not is_tpo_or_chairman(request.user):
             return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
 
         record_id = request.data.get('record_id')
@@ -695,48 +491,34 @@ def debarred_students_api(request):
     DELETE: Undebar a student (officer/chairman).
     """
     if request.method == 'GET':
-        debarred = StudentPlacement.objects.filter(debar='DEBAR').select_related(
-            'unique_id', 'unique_id__id', 'unique_id__id__user'
-        )
+        debarred = get_debarred_students()
         return Response(StudentPlacementSerializer(debarred, many=True).data)
 
     elif request.method == 'POST':
-        if not _is_tpo_or_chairman(request.user):
+        if not is_tpo_or_chairman(request.user):
             return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
 
         roll_no = request.data.get('roll_no', '')
         if not roll_no:
             return Response({'error': 'roll_no is required'}, status=status.HTTP_400_BAD_REQUEST)
 
-        try:
-            extra_info = ExtraInfo.objects.get(id=roll_no)
-            student = Student.objects.get(id=extra_info)
-        except (ExtraInfo.DoesNotExist, Student.DoesNotExist):
-            return Response({'error': 'Student not found'}, status=status.HTTP_404_NOT_FOUND)
-
-        sp, created = StudentPlacement.objects.get_or_create(unique_id=student)
-        sp.debar = 'DEBAR'
-        sp.save()
-
-        return Response({'status': 'debarred', 'roll_no': roll_no})
+        sp = debar_student(roll_no)
+        if sp:
+            return Response({'status': 'debarred', 'roll_no': roll_no})
+        return Response({'error': 'Student not found'}, status=status.HTTP_404_NOT_FOUND)
 
     elif request.method == 'DELETE':
-        if not _is_tpo_or_chairman(request.user):
+        if not is_tpo_or_chairman(request.user):
             return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
 
         roll_no = request.data.get('roll_no', '')
         if not roll_no:
             return Response({'error': 'roll_no is required'}, status=status.HTTP_400_BAD_REQUEST)
 
-        try:
-            extra_info = ExtraInfo.objects.get(id=roll_no)
-            student = Student.objects.get(id=extra_info)
-            sp = StudentPlacement.objects.get(unique_id=student)
-            sp.debar = 'NOT DEBAR'
-            sp.save()
+        sp = undebar_student(roll_no)
+        if sp:
             return Response({'status': 'undebarred', 'roll_no': roll_no})
-        except (ExtraInfo.DoesNotExist, Student.DoesNotExist, StudentPlacement.DoesNotExist):
-            return Response({'error': 'Student not found'}, status=status.HTTP_404_NOT_FOUND)
+        return Response({'error': 'Student not found'}, status=status.HTTP_404_NOT_FOUND)
 
 
 @api_view(['GET'])
@@ -744,25 +526,10 @@ def debarred_students_api(request):
 @authentication_classes([TokenAuthentication])
 def debarred_status_api(request, roll_no):
     """Get debar status for a specific student."""
-    try:
-        extra_info = ExtraInfo.objects.get(id=roll_no)
-        student = Student.objects.get(id=extra_info)
-        sp = StudentPlacement.objects.get(unique_id=student)
-        return Response({
-            'roll_no': roll_no,
-            'name': '{} {}'.format(extra_info.user.first_name, extra_info.user.last_name),
-            'debar': sp.debar,
-            'placed': sp.placed_type,
-        })
-    except StudentPlacement.DoesNotExist:
-        return Response({
-            'roll_no': roll_no,
-            'name': '{} {}'.format(extra_info.user.first_name, extra_info.user.last_name),
-            'debar': 'NOT DEBAR',
-            'placed': 'NOT PLACED',
-        })
-    except (ExtraInfo.DoesNotExist, Student.DoesNotExist):
-        return Response({'error': 'Student not found'}, status=status.HTTP_404_NOT_FOUND)
+    status_data = get_student_debar_status(roll_no)
+    if status_data:
+        return Response(status_data)
+    return Response({'error': 'Student not found'}, status=status.HTTP_404_NOT_FOUND)
 
 
 # =============================================
@@ -775,18 +542,18 @@ def debarred_status_api(request, roll_no):
 def manage_fields_api(request):
     """Manage custom form fields (roles)."""
     if request.method == 'GET':
-        roles = Role.objects.all()
+        roles = get_all_roles()
         return Response(RoleSerializer(roles, many=True).data)
 
     elif request.method == 'POST':
-        if not _is_tpo_or_chairman(request.user):
+        if not is_tpo_or_chairman(request.user):
             return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
 
         role_name = request.data.get('role', '')
         if not role_name:
             return Response({'error': 'role is required'}, status=status.HTTP_400_BAD_REQUEST)
 
-        role_obj, created = Role.objects.get_or_create(role=role_name)
+        role_obj, created = create_or_get_role(role_name)
         return Response(
             RoleSerializer(role_obj).data,
             status=status.HTTP_201_CREATED if created else status.HTTP_200_OK
@@ -798,14 +565,12 @@ def manage_fields_api(request):
 @authentication_classes([TokenAuthentication])
 def form_fields_api(request):
     """Get form field configuration (roles, companies, skills)."""
-    roles = Role.objects.all()
-    companies = CompanyDetails.objects.all()
-    skills = Skill.objects.all()
+    config = get_form_field_config()
 
     return Response({
-        'roles': RoleSerializer(roles, many=True).data,
-        'companies': CompanyDetailsSerializer(companies, many=True).data,
-        'skills': SkillSerializer(skills, many=True).data,
+        'roles': RoleSerializer(config['roles'], many=True).data,
+        'companies': CompanyDetailsSerializer(config['companies'], many=True).data,
+        'skills': SkillSerializer(config['skills'], many=True).data,
     })
 
 
@@ -844,18 +609,18 @@ def company_registration_api(request):
     POST: Register a new company (legacy CompanyDetails).
     """
     if request.method == 'GET':
-        companies = CompanyDetails.objects.all()
+        companies = get_all_companies()
         return Response(CompanyDetailsSerializer(companies, many=True).data)
 
     elif request.method == 'POST':
-        if not _is_tpo_or_chairman(request.user):
+        if not is_tpo_or_chairman(request.user):
             return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
 
         company_name = request.data.get('company_name', '')
         if not company_name:
             return Response({'error': 'company_name is required'}, status=status.HTTP_400_BAD_REQUEST)
 
-        obj, created = CompanyDetails.objects.get_or_create(company_name=company_name)
+        obj, created = register_company(company_name)
         return Response(
             CompanyDetailsSerializer(obj).data,
             status=status.HTTP_201_CREATED if created else status.HTTP_200_OK
@@ -872,7 +637,7 @@ def company_registration_api(request):
 def apply_for_placement_api(request):
     """Student applies/responds to a placement schedule invitation."""
     user = request.user
-    student = _get_student(user)
+    student = get_student(user)
     if not student:
         return Response({'error': 'Student profile not found'}, status=status.HTTP_404_NOT_FOUND)
 
@@ -1050,7 +815,7 @@ def visits_api(request):
         return Response(ChairmanVisitSerializer(visits, many=True).data)
 
     elif request.method == 'POST':
-        if not _is_chairman(request.user):
+        if not is_chairman(request.user):
             return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
 
         serializer = ChairmanVisitSerializer(data=request.data)
@@ -1072,7 +837,7 @@ class CompanyViewSet(viewsets.ModelViewSet):
     queryset = Company.objects.all()
 
     def get_queryset(self):
-        if _is_tpo_or_chairman(self.request.user):
+        if is_tpo_or_chairman(self.request.user):
             return Company.objects.all()
         return Company.objects.filter(approval_status='APPROVED')
 
@@ -1086,7 +851,7 @@ class CompanyViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def approve(self, request, pk=None):
-        if not _is_tpo_or_chairman(request.user):
+        if not is_tpo_or_chairman(request.user):
             return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
         company = self.get_object()
         company.approval_status = 'APPROVED'
@@ -1096,7 +861,7 @@ class CompanyViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def reject(self, request, pk=None):
-        if not _is_tpo_or_chairman(request.user):
+        if not is_tpo_or_chairman(request.user):
             return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
         company = self.get_object()
         company.approval_status = 'REJECTED'
@@ -1112,7 +877,7 @@ class JobPostingViewSet(viewsets.ModelViewSet):
     queryset = JobPosting.objects.all()
 
     def get_queryset(self):
-        if _is_tpo_or_chairman(self.request.user):
+        if is_tpo_or_chairman(self.request.user):
             return JobPosting.objects.select_related('company').all()
         return JobPosting.objects.select_related('company').filter(is_active=True)
 
@@ -1122,7 +887,7 @@ class JobPostingViewSet(viewsets.ModelViewSet):
         return JobPostingSerializer
 
     def perform_create(self, serializer):
-        if not _is_tpo_or_chairman(self.request.user):
+        if not is_tpo_or_chairman(self.request.user):
             raise PermissionError("Not authorized")
         serializer.save(posted_by=self.request.user)
 
@@ -1169,11 +934,7 @@ class JobPostingViewSet(viewsets.ModelViewSet):
         if not can_apply:
             return Response({'error': policy_reason}, status=400)
 
-        application = JobApplication.objects.create(
-            job_posting=posting,
-            student=student,
-            status='APPLIED',
-        )
+        application = create_job_application(student, posting)
         return Response(
             JobApplicationSerializer(application).data,
             status=status.HTTP_201_CREATED
@@ -1182,7 +943,7 @@ class JobPostingViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['get'])
     def applications(self, request, pk=None):
         """TPO gets all applications for a posting."""
-        if not _is_tpo_or_chairman(request.user):
+        if not is_tpo_or_chairman(request.user):
             return Response({'error': 'Not authorized'}, status=403)
         posting = self.get_object()
         apps = posting.applications.select_related('student', 'student__id__user')
@@ -1197,7 +958,7 @@ class JobApplicationViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if _is_tpo_or_chairman(user):
+        if is_tpo_or_chairman(user):
             return JobApplication.objects.all()
         profile = get_object_or_404(ExtraInfo, user=user)
         try:
@@ -1209,17 +970,13 @@ class JobApplicationViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def update_status(self, request, pk=None):
         """TPO updates application status."""
-        if not _is_tpo_or_chairman(request.user):
+        if not is_tpo_or_chairman(request.user):
             return Response({'error': 'Not authorized'}, status=403)
         application = self.get_object()
         new_status = request.data.get('status')
         remarks = request.data.get('remarks', '')
-        if new_status:
-            application.status = new_status
-            if remarks:
-                application.remarks = remarks
-            application.save()
-        return Response(JobApplicationSerializer(application).data)
+        updated_app = update_job_application_status(application, new_status, remarks)
+        return Response(JobApplicationSerializer(updated_app).data)
 
 
 class JobOfferViewSet(viewsets.ModelViewSet):
@@ -1230,7 +987,7 @@ class JobOfferViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if _is_tpo_or_chairman(user):
+        if is_tpo_or_chairman(user):
             return JobOffer.objects.all()
         profile = get_object_or_404(ExtraInfo, user=user)
         try:
@@ -1244,33 +1001,10 @@ class JobOfferViewSet(viewsets.ModelViewSet):
         """Student accepts or rejects an offer."""
         offer = self.get_object()
         action_type = request.data.get('action')
-        if offer.status != 'PENDING':
-            return Response({'error': 'Offer already {}'.format(offer.status)}, status=400)
-
-        if action_type == 'accept':
-            offer.status = 'ACCEPTED'
-            offer.responded_at = timezone.now()
-            offer.save()
-            offer.application.status = 'OFFER_ACCEPTED'
-            offer.application.save()
-
-            # Update StudentPlacement
-            student = offer.application.student
-            sp, created = StudentPlacement.objects.get_or_create(unique_id=student)
-            sp.placed_type = 'PLACED'
-            sp.placement_date = datetime.date.today()
-            sp.package = offer.ctc_offered
-            sp.save()
-
-            return Response({'status': 'accepted'})
-        elif action_type == 'reject':
-            offer.status = 'REJECTED'
-            offer.responded_at = timezone.now()
-            offer.save()
-            offer.application.status = 'OFFER_REJECTED'
-            offer.application.save()
-            return Response({'status': 'rejected'})
-        return Response({'error': 'Invalid action'}, status=400)
+        success, message = process_offer_response(offer, action_type)
+        if success:
+            return Response({'status': message})
+        return Response({'error': message}, status=400)
 
 
 class AnnouncementViewSet(viewsets.ModelViewSet):
@@ -1323,9 +1057,10 @@ def my_application_summary_api(request):
 def dashboard_api(request):
     """PCMS dashboard summary data."""
     user = request.user
-    is_chairman_val = _is_chairman(user)
-    is_officer_val = _is_officer(user)
-    is_student_val = _is_student(user)
+    roles = get_user_roles(user)
+    is_chairman_val = roles['is_chairman']
+    is_officer_val = roles['is_officer']
+    is_student_val = roles['is_student']
 
     data = {
         'is_chairman': is_chairman_val,
@@ -1334,14 +1069,14 @@ def dashboard_api(request):
     }
 
     if is_student_val:
-        student = _get_student(user)
+        student = get_student(user)
         if student:
             active_postings = JobPosting.objects.filter(is_active=True).count()
             my_apps = JobApplication.objects.filter(student=student).count()
             my_offers_count = JobOffer.objects.filter(
                 application__student=student, status='PENDING'
             ).count()
-            announcements = Announcement.objects.filter(is_active=True)[:5]
+            announcements = get_active_announcements(limit=5)
 
             data.update({
                 'active_postings': active_postings,
@@ -1378,42 +1113,15 @@ def reports_api(request):
     prog_filter = request.query_params.get('programme')
     job_type_filter = request.query_params.get('job_type')
 
-    stats = get_placement_statistics(year=year_filter)
-
-    offers_qs = JobOffer.objects.filter(status='ACCEPTED').select_related(
-        'application__student__id__department',
-        'application__student',
-        'application__job_posting__company'
-    )
-
-    if year_filter:
-        offers_qs = offers_qs.filter(application__job_posting__created_at__year=year_filter)
-    if dept_filter:
-        offers_qs = offers_qs.filter(application__student__id__department__name=dept_filter)
-    if prog_filter:
-        offers_qs = offers_qs.filter(application__student__programme=prog_filter)
-    if job_type_filter:
-        offers_qs = offers_qs.filter(application__job_posting__job_type=job_type_filter)
-
-    companies_participated = Company.objects.filter(
-        approval_status='APPROVED',
-        job_postings__is_active=True
-    ).distinct().count()
-
-    total_students = Student.objects.count()
-    placed_students = JobOffer.objects.filter(status='ACCEPTED').values(
-        'application__student'
-    ).distinct().count()
-
-    placement_rate = (placed_students / total_students * 100) if total_students > 0 else 0
+    report_data = get_placement_report_data(year_filter, dept_filter, prog_filter, job_type_filter)
 
     return Response({
-        'stats': stats,
-        'offers': JobOfferSerializer(offers_qs, many=True).data,
-        'companies_participated': companies_participated,
-        'total_students': total_students,
-        'placed_students': placed_students,
-        'placement_rate': round(placement_rate, 2),
+        'stats': report_data['stats'],
+        'offers': JobOfferSerializer(report_data['offers'], many=True).data,
+        'companies_participated': report_data['companies_participated'],
+        'total_students': report_data['total_students'],
+        'placed_students': report_data['placed_students'],
+        'placement_rate': report_data['placement_rate'],
     })
 
 
@@ -1509,3 +1217,212 @@ def interview_detail_api(request, interview_id):
             serializer.save()
             return Response(serializer.data)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+
+
+def check_eligibility(student, job_posting):
+    """
+    Validates whether a student is eligible to apply for a given job posting.
+    Returns (is_eligible: bool, reasons: list[str])
+    """
+    reasons = []
+
+    # 1. Check if student is debarred
+    try:
+        sp = StudentPlacement.objects.get(unique_id=student)
+        if sp.debar == 'DEBAR':
+            reasons.append("You are currently debarred from placement activities.")
+            return False, reasons
+    except StudentPlacement.DoesNotExist:
+        pass
+
+    # 2. Check CPI
+    if job_posting.min_cpi and student.cpi < job_posting.min_cpi:
+        reasons.append(
+            "Minimum CPI required: {}. Your CPI: {}.".format(job_posting.min_cpi, student.cpi)
+        )
+
+    # 3. Check programme eligibility
+    if job_posting.eligible_programmes:
+        eligible_progs = [p.strip().upper() for p in job_posting.eligible_programmes.split(',')]
+        student_prog = student.programme.upper() if student.programme else ''
+        if student_prog and student_prog not in eligible_progs:
+            reasons.append(
+                "Your programme ({}) is not eligible. Eligible: {}.".format(
+                    student.programme, job_posting.eligible_programmes
+                )
+            )
+
+    # 4. Check branch/department eligibility
+    if job_posting.eligible_branches:
+        eligible_branches = [b.strip().upper() for b in job_posting.eligible_branches.split(',')]
+        try:
+            student_dept = student.id.department.name.upper() if student.id.department else ''
+        except Exception:
+            student_dept = ''
+
+        # Also check specialization for M.Tech
+        student_spec = student.specialization.upper() if student.specialization else ''
+
+        if student_dept and student_dept not in eligible_branches:
+            if not (student_spec and student_spec in eligible_branches):
+                reasons.append(
+                    "Your branch/department is not eligible. Eligible: {}.".format(
+                        job_posting.eligible_branches
+                    )
+                )
+
+    # 5. Check batch eligibility
+    if job_posting.eligible_batch_from and student.batch < job_posting.eligible_batch_from:
+        reasons.append(
+            "Minimum batch year: {}. Your batch: {}.".format(
+                job_posting.eligible_batch_from, student.batch
+            )
+        )
+    if job_posting.eligible_batch_to and student.batch > job_posting.eligible_batch_to:
+        reasons.append(
+            "Maximum batch year: {}. Your batch: {}.".format(
+                job_posting.eligible_batch_to, student.batch
+            )
+        )
+
+    # 6. Check required skills
+    if job_posting.required_skills.exists():
+        student_skills = Has.objects.filter(unique_id=student).values_list('skill_id', flat=True)
+        required_skill_ids = job_posting.required_skills.values_list('id', flat=True)
+        missing_skills = set(required_skill_ids) - set(student_skills)
+        if missing_skills:
+            missing_names = Skill.objects.filter(id__in=missing_skills).values_list('skill', flat=True)
+            reasons.append(
+                "Missing required skills: {}.".format(', '.join(missing_names))
+            )
+
+    # 7. Check application deadline
+    if job_posting.is_deadline_passed:
+        reasons.append("Application deadline has passed.")
+
+    # 8. Check if job is active
+    if not job_posting.is_active:
+        reasons.append("This job posting is no longer active.")
+
+    is_eligible = len(reasons) == 0
+    return is_eligible, reasons
+
+
+def check_duplicate_application(student, job_posting):
+    """
+    Check if a student has already applied for this job posting.
+    Returns True if duplicate exists.
+    """
+    return JobApplication.objects.filter(
+        student=student, job_posting=job_posting
+    ).exists()
+
+
+def check_placement_policy(student, job_posting):
+    """
+    Enforce placement policies (e.g., max offers, dream company rules).
+    Returns (can_apply: bool, reason: str)
+    """
+    active_policy = PlacementPolicy.objects.filter(is_active=True).first()
+    if not active_policy:
+        return True, ""
+
+    # Check if student already has max offers accepted
+    accepted_offers_count = JobOffer.objects.filter(
+        application__student=student,
+        status='ACCEPTED'
+    ).count()
+
+    if accepted_offers_count >= active_policy.max_offers_allowed:
+        # Check dream company exception
+        if active_policy.allow_dream_company and job_posting.ctc >= active_policy.dream_ctc_threshold:
+            return True, ""
+        return False, "You have already accepted {} offer(s). Maximum allowed: {}.".format(
+            accepted_offers_count, active_policy.max_offers_allowed
+        )
+
+    return True, ""
+
+
+def expire_pending_offers():
+    """
+    Utility to mark pending offers as expired if the deadline has passed.
+    Should be called periodically (e.g., via celery task or management command).
+    """
+    expired = JobOffer.objects.filter(
+        status='PENDING',
+        response_deadline__lt=timezone.now()
+    ).update(status='EXPIRED')
+    return expired
+
+
+def get_placement_statistics(year=None):
+    """
+    Generate aggregated placement statistics.
+    Returns a dict with placement data.
+    """
+    from django.db.models import Avg, Count, Max, Min, Sum
+
+    filters = {}
+    if year:
+        filters['application__job_posting__created_at__year'] = year
+
+    offers = JobOffer.objects.filter(status='ACCEPTED', **filters)
+
+    stats = {
+        'total_offers': offers.count(),
+        'avg_ctc': offers.aggregate(avg=Avg('ctc_offered'))['avg'] or 0,
+        'max_ctc': offers.aggregate(max=Max('ctc_offered'))['max'] or 0,
+        'min_ctc': offers.aggregate(min=Min('ctc_offered'))['min'] or 0,
+        'total_ctc': offers.aggregate(total=Sum('ctc_offered'))['total'] or 0,
+    }
+
+    # Company-wise stats
+    stats['company_wise'] = offers.values(
+        'application__job_posting__company__name'
+    ).annotate(
+        count=Count('id'),
+        avg_package=Avg('ctc_offered')
+    ).order_by('-count')
+
+    # Branch-wise stats
+    stats['branch_wise'] = offers.values(
+        'application__student__id__department__name'
+    ).annotate(
+        count=Count('id'),
+        avg_package=Avg('ctc_offered')
+    ).order_by('-count')
+
+    # Programme-wise stats
+    stats['programme_wise'] = offers.values(
+        'application__student__programme'
+    ).annotate(
+        count=Count('id'),
+        avg_package=Avg('ctc_offered')
+    ).order_by('-count')
+
+    return stats
+
+
+def get_student_application_summary(student):
+    """
+    Get a summary of a student's placement applications.
+    """
+    applications = JobApplication.objects.filter(student=student).select_related(
+        'job_posting', 'job_posting__company'
+    )
+
+    summary = {
+        'total': applications.count(),
+        'applied': applications.filter(status='APPLIED').count(),
+        'shortlisted': applications.filter(status='SHORTLISTED').count(),
+        'interview_scheduled': applications.filter(status='INTERVIEW_SCHEDULED').count(),
+        'offer_extended': applications.filter(status='OFFER_EXTENDED').count(),
+        'offer_accepted': applications.filter(status='OFFER_ACCEPTED').count(),
+        'offer_rejected': applications.filter(status='OFFER_REJECTED').count(),
+        'rejected': applications.filter(status='REJECTED').count(),
+        'applications': applications,
+    }
+    return summary
