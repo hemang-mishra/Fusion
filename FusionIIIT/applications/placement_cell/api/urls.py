@@ -10,6 +10,7 @@ router.register(r'job-postings', api_views.JobPostingViewSet, basename='jobposti
 router.register(r'job-applications', api_views.JobApplicationViewSet, basename='jobapplication')
 router.register(r'job-offers', api_views.JobOfferViewSet, basename='joboffer')
 router.register(r'announcements', api_views.AnnouncementViewSet, basename='announcement')
+router.register(r'appeals', api_views.AppealViewSet, basename='appeal')
 
 urlpatterns = [
     # 1. Role & Auth

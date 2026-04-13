@@ -9,6 +9,7 @@ from applications.placement_cell.models import (
     StudentPlacement, Role, CompanyDetails, MessageOfficer,
     Company, JobPosting, JobApplication, InterviewSchedule,
     InterviewPanel, JobOffer, Announcement, PlacementPolicy,
+    Appeal,
 )
 
 
@@ -401,3 +402,39 @@ class PlacementPolicySerializer(serializers.ModelSerializer):
         model = PlacementPolicy
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at')
+
+
+class AppealSerializer(serializers.ModelSerializer):
+    student_name = serializers.SerializerMethodField()
+    student_roll = serializers.SerializerMethodField()
+    company_name = serializers.SerializerMethodField()
+    job_title = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Appeal
+        fields = '__all__'
+        read_only_fields = ('status', 'remarks', 'created_at', 'resolved_at', 'student_name', 'student_roll', 'company_name', 'job_title')
+
+    def get_student_name(self, obj):
+        try:
+            return '{} {}'.format(obj.application.student.id.user.first_name, obj.application.student.id.user.last_name)
+        except Exception:
+            return ''
+
+    def get_student_roll(self, obj):
+        try:
+            return str(obj.application.student.id.id)
+        except Exception:
+            return ''
+
+    def get_company_name(self, obj):
+        try:
+            return obj.application.job_posting.company.name
+        except Exception:
+            return ''
+
+    def get_job_title(self, obj):
+        try:
+            return obj.application.job_posting.title
+        except Exception:
+            return ''

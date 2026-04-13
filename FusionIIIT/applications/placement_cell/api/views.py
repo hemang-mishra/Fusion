@@ -39,7 +39,7 @@ from applications.placement_cell.models import (
     Skill, StudentPlacement, StudentRecord, Role, CompanyDetails,
     Company, JobPosting, JobApplication, InterviewSchedule,
     InterviewPanel, JobOffer, Announcement, PlacementPolicy,
-    Coauthor, Coinventor,
+    Coauthor, Coinventor, Appeal,
 )
 
 from applications.placement_cell.api.serializers import (
@@ -58,6 +58,7 @@ from applications.placement_cell.api.serializers import (
     JobOfferSerializer,
     AnnouncementSerializer,
     PlacementPolicySerializer,
+    AppealSerializer,
 )
 
 # Import business logic services
@@ -1005,6 +1006,50 @@ class JobOfferViewSet(viewsets.ModelViewSet):
         if success:
             return Response({'status': message})
         return Response({'error': message}, status=400)
+
+
+class AppealViewSet(viewsets.ModelViewSet):
+    """API endpoint for managing appeals."""
+    permission_classes = [IsAuthenticated]
+    serializer_class = AppealSerializer
+    queryset = Appeal.objects.all()
+
+    def get_queryset(self):
+        user = self.request.user
+        if is_tpo_or_chairman(user):
+            return Appeal.objects.all()
+        profile = get_object_or_404(ExtraInfo, user=user)
+        try:
+            student = Student.objects.get(id=profile)
+            return Appeal.objects.filter(application__student=student)
+        except Student.DoesNotExist:
+            return Appeal.objects.none()
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        profile = get_object_or_404(ExtraInfo, user=user)
+        student = get_object_or_404(Student, id=profile)
+        # Verify application belongs to student
+        application = get_object_or_404(JobApplication, id=self.request.data.get('application'), student=student)
+        serializer.save(application=application)
+
+    @action(detail=True, methods=['post'])
+    def resolve(self, request, pk=None):
+        if not is_tpo_or_chairman(request.user):
+            return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
+        appeal = self.get_object()
+        appeal.status = request.data.get('status', 'RESOLVED')
+        appeal.remarks = request.data.get('remarks', '')
+        appeal.resolved_at = timezone.now()
+        appeal.save()
+
+        # Optionally update application status
+        new_app_status = request.data.get('application_status')
+        if new_app_status:
+            appeal.application.status = new_app_status
+            appeal.application.save()
+
+        return Response(AppealSerializer(appeal).data)
 
 
 class AnnouncementViewSet(viewsets.ModelViewSet):

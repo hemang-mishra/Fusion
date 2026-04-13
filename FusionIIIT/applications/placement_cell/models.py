@@ -730,3 +730,28 @@ class PlacementPolicy(models.Model):
     def __str__(self):
         return self.name
 
+class Appeal(models.Model):
+    """
+    Appeals by students against placement decisions (e.g., interview rejections).
+    """
+    application = models.ForeignKey(JobApplication, on_delete=models.CASCADE, related_name='appeals')
+    reason = models.TextField(max_length=2000, help_text="Reason for the appeal")
+    status = models.CharField(
+        max_length=20,
+        choices=(('PENDING', 'Pending'), ('RESOLVED', 'Resolved'), ('REJECTED', 'Rejected')),
+        default='PENDING'
+    )
+    remarks = models.TextField(max_length=2000, blank=True, null=True, help_text="TPO remarks on resolution")
+    created_at = models.DateTimeField(auto_now_add=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return 'Appeal by {} for {} ({})'.format(
+            self.application.student.id.user.username,
+            self.application.job_posting.company.name,
+            self.status
+        )
+
