@@ -39,7 +39,8 @@ from applications.placement_cell.models import (
     Skill, StudentPlacement, StudentRecord, Role, CompanyDetails,
     Company, JobPosting, JobApplication, InterviewSchedule,
     InterviewPanel, JobOffer, Announcement, PlacementPolicy,
-    Coauthor, Coinventor, Appeal,
+    Coauthor, Coinventor, Appeal, PlacementProfile, PlacementProfileAuditLog,
+    AlumniProfile, MentorshipProfile, MentorshipSession, JobReferral,
 )
 
 from applications.placement_cell.api.serializers import (
@@ -57,13 +58,17 @@ from applications.placement_cell.api.serializers import (
     InterviewScheduleSerializer, InterviewPanelSerializer,
     JobOfferSerializer,
     AnnouncementSerializer,
-    PlacementPolicySerializer,
+    PlacementPolicySerializer, PlacementProfileSerializer,
     AppealSerializer,
+    AlumniProfileSerializer, AlumniProfileListSerializer,
+    MentorshipProfileSerializer, MentorshipSessionSerializer,
+    JobReferralSerializer,
 )
 
 # Import business logic services
 from applications.placement_cell.services import (
-    is_tpo_or_chairman, is_chairman, is_officer, is_student, get_student, get_user_roles,
+    is_tpo_or_chairman, is_chairman, is_officer, is_student, is_alumni,
+    get_student, get_alumni_profile, get_user_roles,
     check_invitation_date, create_placement_schedule, update_student_invitation,
     delete_placement_schedule, get_all_students_with_placement_info, get_student_cv_data,
     build_cv_context, get_placement_status_list, update_student_placement_status,
@@ -76,6 +81,7 @@ from applications.placement_cell.services import (
     create_interview_schedule, get_interview_details, get_placement_policies,
     create_or_update_policy, toggle_policy_active, get_all_roles, create_or_get_role,
     get_form_field_config, get_active_announcements,
+    approve_alumni, reject_alumni,
 )
 
 
@@ -262,6 +268,24 @@ def cv_data_api(request, username):
     cv_data['conferences'] = ConferenceSerializer(cv_data['conferences'], many=True).data
     cv_data['publications'] = PublicationSerializer(cv_data['publications'], many=True).data
     cv_data['patents'] = PatentSerializer(cv_data['patents'], many=True).data
+
+    # Merge PlacementProfile social links so the frontend can build a rich resume
+    try:
+        from applications.globals.models import ExtraInfo as _ExtraInfo
+        from applications.academic_information.models import Student as _Student
+        _profile = _ExtraInfo.objects.get(user=target_user)
+        _student = _Student.objects.get(id=_profile)
+        pp = PlacementProfile.objects.get(student=_student)
+        cv_data['linkedin_url']  = pp.linkedin_url or ''
+        cv_data['github_url']    = pp.github_url or ''
+        cv_data['portfolio_url'] = pp.portfolio_url or ''
+        # Prefer PlacementProfile about_me if set, else fall back to ExtraInfo
+        if pp.about_me:
+            cv_data['profile']['about_me'] = pp.about_me
+    except Exception:
+        cv_data.setdefault('linkedin_url', '')
+        cv_data.setdefault('github_url', '')
+        cv_data.setdefault('portfolio_url', '')
 
     return Response(cv_data)
 
@@ -1471,3 +1495,297 @@ def get_student_application_summary(student):
         'applications': applications,
     }
     return summary
+
+
+class PlacementProfileViewSet(viewsets.ModelViewSet):
+    serializer_class = PlacementProfileSerializer
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        # Admin can see all, student can see only theirs
+        user = self.request.user
+        if is_student(user):
+            student = get_object_or_404(Student, id__user=user)
+            return PlacementProfile.objects.filter(student=student)
+        return PlacementProfile.objects.all()
+
+    def list(self, request, *args, **kwargs):
+        if is_student(request.user):
+            # Create if doesn't exist
+            student = get_object_or_404(Student, id__user=request.user)
+            profile, created = PlacementProfile.objects.get_or_create(student=student)
+            serializer = self.get_serializer(profile)
+            return Response(serializer.data)
+        
+        # otherwise return normal list
+        return super().list(request, *args, **kwargs)
+
+    def perform_update(self, serializer):
+        # Save old state for audit
+        instance = self.get_object()
+        old_data = self.get_serializer(instance).data
+        
+        # Save the new state
+        new_instance = serializer.save()
+        new_data = self.get_serializer(new_instance).data
+        
+        # Calculate differences and create audit log
+        changes = {}
+        # Only log fields that we care about
+        fields_to_track = ['resume', 'about_me', 'linkedin_url', 'portfolio_url', 
+                           'github_url', 'achievements', 'certifications']
+        
+        for field in fields_to_track:
+            old_value = old_data.get(field)
+            new_value = new_data.get(field)
+            if old_value != new_value:
+                changes[field] = {
+                    'old': old_value,
+                    'new': new_value
+                }
+                
+        if changes:
+            PlacementProfileAuditLog.objects.create(
+                profile=new_instance,
+                changed_by=self.request.user,
+                changes=changes
+            )
+
+
+# =============================================
+# ALUMNI NETWORK VIEWSETS
+# =============================================
+
+class AlumniProfileViewSet(viewsets.ModelViewSet):
+    """
+    Alumni registration and profile management.
+    - Any authenticated user can POST to register as alumni.
+    - TPO/Chairman can list all alumni (filterable by status) and approve/reject.
+    - Students see only APPROVED alumni.
+    - Alumni can PATCH their own profile.
+    """
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [TokenAuthentication]
+
+    def get_serializer_class(self):
+        if self.action == 'list' and not is_tpo_or_chairman(self.request.user):
+            return AlumniProfileListSerializer
+        return AlumniProfileSerializer
+
+    def get_queryset(self):
+        user = self.request.user
+        if is_tpo_or_chairman(user):
+            qs = AlumniProfile.objects.all()
+            status_filter = self.request.query_params.get('status')
+            if status_filter:
+                qs = qs.filter(approval_status=status_filter.upper())
+            return qs
+        elif is_alumni(user):
+            return AlumniProfile.objects.filter(user=user)
+        else:
+            # Students & others see only approved alumni
+            return AlumniProfile.objects.filter(approval_status='APPROVED')
+
+    def perform_create(self, serializer):
+        # Check if the user already has an alumni profile
+        if AlumniProfile.objects.filter(user=self.request.user).exists():
+            raise serializers.ValidationError(
+                {'detail': 'You have already registered as an alumni.'}
+            )
+        serializer.save(user=self.request.user)
+
+    def perform_update(self, serializer):
+        instance = self.get_object()
+        if instance.user != self.request.user and not is_tpo_or_chairman(self.request.user):
+            raise serializers.ValidationError(
+                {'detail': 'You can only update your own profile.'}
+            )
+        serializer.save()
+
+    @action(detail=True, methods=['post'], url_path='approve')
+    def approve(self, request, pk=None):
+        """TPO/Chairman approves an alumni registration."""
+        if not is_tpo_or_chairman(request.user):
+            return Response({'detail': 'Not authorized.'}, status=status.HTTP_403_FORBIDDEN)
+        profile = self.get_object()
+        if profile.approval_status == 'APPROVED':
+            return Response({'detail': 'Already approved.'}, status=status.HTTP_400_BAD_REQUEST)
+        approve_alumni(profile, request.user)
+        return Response(AlumniProfileSerializer(profile).data)
+
+    @action(detail=True, methods=['post'], url_path='reject')
+    def reject(self, request, pk=None):
+        """TPO/Chairman rejects an alumni registration."""
+        if not is_tpo_or_chairman(request.user):
+            return Response({'detail': 'Not authorized.'}, status=status.HTTP_403_FORBIDDEN)
+        profile = self.get_object()
+        remarks = request.data.get('remarks', '')
+        reject_alumni(profile, remarks)
+        return Response(AlumniProfileSerializer(profile).data)
+
+    @action(detail=False, methods=['get'], url_path='me')
+    def me(self, request):
+        """Get the current user's alumni profile (or 404)."""
+        profile = get_alumni_profile(request.user)
+        if not profile:
+            return Response({'detail': 'No alumni profile found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(AlumniProfileSerializer(profile).data)
+
+
+class MentorshipProfileViewSet(viewsets.ModelViewSet):
+    """
+    Mentorship profile management.
+    - Alumni create/update their mentorship profile.
+    - Students & TPO can list available mentors.
+    """
+    serializer_class = MentorshipProfileSerializer
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [TokenAuthentication]
+
+    def get_queryset(self):
+        user = self.request.user
+        if is_alumni(user):
+            alumni = get_alumni_profile(user)
+            if alumni:
+                return MentorshipProfile.objects.filter(alumni=alumni)
+            return MentorshipProfile.objects.none()
+        # Students & TPO see available mentors only
+        qs = MentorshipProfile.objects.filter(
+            is_available=True,
+            alumni__approval_status='APPROVED'
+        )
+        return qs
+
+    def perform_create(self, serializer):
+        alumni = get_alumni_profile(self.request.user)
+        if not alumni or not alumni.is_approved:
+            raise serializers.ValidationError(
+                {'detail': 'Only approved alumni can create a mentorship profile.'}
+            )
+        if MentorshipProfile.objects.filter(alumni=alumni).exists():
+            raise serializers.ValidationError(
+                {'detail': 'You already have a mentorship profile. Use PATCH to update.'}
+            )
+        serializer.save(alumni=alumni)
+
+    def perform_update(self, serializer):
+        instance = self.get_object()
+        if instance.alumni.user != self.request.user:
+            raise serializers.ValidationError(
+                {'detail': 'You can only update your own mentorship profile.'}
+            )
+        serializer.save()
+
+
+class MentorshipSessionViewSet(viewsets.ModelViewSet):
+    """
+    Mentorship session booking.
+    - Students create (request) sessions.
+    - Mentors confirm/cancel and add meeting link.
+    - Both parties list their sessions.
+    """
+    serializer_class = MentorshipSessionSerializer
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [TokenAuthentication]
+
+    def get_queryset(self):
+        user = self.request.user
+        if is_alumni(user):
+            alumni = get_alumni_profile(user)
+            if alumni:
+                try:
+                    mp = alumni.mentorship_profile
+                    return MentorshipSession.objects.filter(mentor=mp)
+                except MentorshipProfile.DoesNotExist:
+                    pass
+            return MentorshipSession.objects.none()
+        elif is_student(user):
+            student = get_student(user)
+            if student:
+                return MentorshipSession.objects.filter(student=student)
+            return MentorshipSession.objects.none()
+        elif is_tpo_or_chairman(user):
+            return MentorshipSession.objects.all()
+        return MentorshipSession.objects.none()
+
+    def perform_create(self, serializer):
+        student = get_student(self.request.user)
+        if not student:
+            raise serializers.ValidationError(
+                {'detail': 'Only students can request mentorship sessions.'}
+            )
+        serializer.save(student=student)
+
+    def perform_update(self, serializer):
+        instance = self.get_object()
+        user = self.request.user
+        # Mentor can update status, meeting_link, mentor_notes
+        if is_alumni(user) and instance.mentor.alumni.user == user:
+            serializer.save()
+        elif is_student(user) and instance.student.id.user == user:
+            # Student can only cancel
+            if serializer.validated_data.get('status') not in (None, 'CANCELLED'):
+                raise serializers.ValidationError(
+                    {'detail': 'Students can only cancel sessions.'}
+                )
+            serializer.save()
+        elif is_tpo_or_chairman(user):
+            serializer.save()
+        else:
+            raise serializers.ValidationError(
+                {'detail': 'Not authorized to update this session.'}
+            )
+
+
+class JobReferralViewSet(viewsets.ModelViewSet):
+    """
+    Job referral postings by alumni.
+    - Alumni CRUD their own referrals.
+    - Students list active referrals.
+    - TPO can moderate (delete).
+    """
+    serializer_class = JobReferralSerializer
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [TokenAuthentication]
+
+    def get_queryset(self):
+        user = self.request.user
+        if is_alumni(user):
+            alumni = get_alumni_profile(user)
+            if alumni:
+                return JobReferral.objects.filter(posted_by=alumni)
+            return JobReferral.objects.none()
+        elif is_tpo_or_chairman(user):
+            return JobReferral.objects.all()
+        else:
+            # Students see only active, non-expired referrals
+            from datetime import date as _date
+            return JobReferral.objects.filter(
+                is_active=True
+            ).filter(
+                Q(deadline__isnull=True) | Q(deadline__gte=_date.today())
+            )
+
+    def perform_create(self, serializer):
+        alumni = get_alumni_profile(self.request.user)
+        if not alumni or not alumni.is_approved:
+            raise serializers.ValidationError(
+                {'detail': 'Only approved alumni can post job referrals.'}
+            )
+        serializer.save(posted_by=alumni)
+
+    def perform_update(self, serializer):
+        instance = self.get_object()
+        if instance.posted_by.user != self.request.user and not is_tpo_or_chairman(self.request.user):
+            raise serializers.ValidationError(
+                {'detail': 'You can only update your own referrals.'}
+            )
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        if instance.posted_by.user != self.request.user and not is_tpo_or_chairman(self.request.user):
+            raise serializers.ValidationError(
+                {'detail': 'You can only delete your own referrals.'}
+            )
+        instance.delete()
+

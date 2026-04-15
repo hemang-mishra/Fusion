@@ -11,6 +11,11 @@ router.register(r'job-applications', api_views.JobApplicationViewSet, basename='
 router.register(r'job-offers', api_views.JobOfferViewSet, basename='joboffer')
 router.register(r'announcements', api_views.AnnouncementViewSet, basename='announcement')
 router.register(r'appeals', api_views.AppealViewSet, basename='appeal')
+router.register(r'placement-profile', api_views.PlacementProfileViewSet, basename='placementprofile')
+router.register(r'alumni', api_views.AlumniProfileViewSet, basename='alumni')
+router.register(r'mentorship', api_views.MentorshipProfileViewSet, basename='mentorship')
+router.register(r'mentorship-sessions', api_views.MentorshipSessionViewSet, basename='mentorshipsession')
+router.register(r'job-referrals', api_views.JobReferralViewSet, basename='jobreferral')
 
 urlpatterns = [
     # 1. Role & Auth

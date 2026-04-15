@@ -176,3 +176,41 @@ admin.site.register(JobOffer, JobOfferAdmin)
 admin.site.register(Announcement, AnnouncementAdmin)
 admin.site.register(PlacementPolicy, PlacementPolicyAdmin)
 
+
+# =============================================
+# Alumni Network Admin
+# =============================================
+
+from .models import AlumniProfile, MentorshipProfile, MentorshipSession, JobReferral
+
+
+class AlumniProfileAdmin(admin.ModelAdmin):
+    list_display = ('user', 'graduation_year', 'programme', 'department',
+                    'current_company', 'approval_status', 'created_at')
+    list_filter = ('approval_status', 'graduation_year', 'programme')
+    search_fields = ('user__first_name', 'user__last_name', 'user__username',
+                     'current_company')
+
+
+class MentorshipProfileAdmin(admin.ModelAdmin):
+    list_display = ('alumni', 'is_available', 'max_sessions_per_month', 'updated_at')
+    list_filter = ('is_available',)
+
+
+class MentorshipSessionAdmin(admin.ModelAdmin):
+    list_display = ('mentor', 'student', 'topic', 'status',
+                    'scheduled_date', 'created_at')
+    list_filter = ('status', 'scheduled_date')
+
+
+class JobReferralAdmin(admin.ModelAdmin):
+    list_display = ('role_title', 'company_name', 'posted_by', 'is_active',
+                    'deadline', 'created_at')
+    list_filter = ('is_active', 'deadline')
+    search_fields = ('role_title', 'company_name')
+
+
+admin.site.register(AlumniProfile, AlumniProfileAdmin)
+admin.site.register(MentorshipProfile, MentorshipProfileAdmin)
+admin.site.register(MentorshipSession, MentorshipSessionAdmin)
+admin.site.register(JobReferral, JobReferralAdmin)
