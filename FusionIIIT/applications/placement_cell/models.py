@@ -111,6 +111,13 @@ class Constants:
         ('OFFLINE', 'Offline'),
     )
 
+    INTERVIEW_RESULT = (
+        ('PENDING', 'Pending'),
+        ('SELECTED', 'Selected'),
+        ('REJECTED', 'Rejected'),
+        ('WAITLISTED', 'Waitlisted'),
+    )
+
     OFFER_STATUS = (
         ('PENDING', 'Pending'),
         ('ACCEPTED', 'Accepted'),
@@ -589,16 +596,34 @@ class JobApplication(models.Model):
 class InterviewSchedule(models.Model):
     """
     Tracks interview schedules for shortlisted students for a job posting.
+    Includes conflict detection via date/time_slot/end_time/venue and
+    reschedule tracking (max 2 reschedules enforced at the API layer).
     """
     job_posting = models.ForeignKey(JobPosting, on_delete=models.CASCADE, related_name='interviews')
     date = models.DateField()
     time_slot = models.TimeField()
+    duration_minutes = models.PositiveIntegerField(
+        default=60,
+        help_text="Duration of the interview slot in minutes"
+    )
+    end_time = models.TimeField(
+        null=True, blank=True,
+        help_text="Auto-computed from time_slot + duration_minutes"
+    )
     mode = models.CharField(max_length=10, choices=Constants.INTERVIEW_MODE, default='OFFLINE')
     venue_or_link = models.CharField(
         max_length=500, blank=True, null=True,
         help_text="Physical venue or online meeting link"
     )
     description = models.TextField(max_length=1000, blank=True, null=True)
+    round_number = models.PositiveIntegerField(
+        default=1,
+        help_text="Interview round number (1, 2, 3...)"
+    )
+    reschedule_count = models.PositiveIntegerField(
+        default=0,
+        help_text="Number of times this interview has been rescheduled (max 2)"
+    )
     created_by = models.ForeignKey(
         User, on_delete=models.SET_NULL, null=True, blank=True,
         related_name='created_interviews'
@@ -608,8 +633,18 @@ class InterviewSchedule(models.Model):
     class Meta:
         ordering = ['date', 'time_slot']
 
+    def save(self, *args, **kwargs):
+        """Auto-compute end_time from time_slot + duration_minutes."""
+        if self.time_slot and self.duration_minutes:
+            start_dt = datetime.datetime.combine(datetime.date.today(), self.time_slot)
+            end_dt = start_dt + datetime.timedelta(minutes=self.duration_minutes)
+            self.end_time = end_dt.time()
+        super().save(*args, **kwargs)
+
     def __str__(self):
-        return 'Interview for {} on {}'.format(self.job_posting.title, self.date)
+        return 'Interview for {} on {} (Round {})'.format(
+            self.job_posting.title, self.date, self.round_number
+        )
 
 
 class InterviewPanel(models.Model):
@@ -620,8 +655,10 @@ class InterviewPanel(models.Model):
     application = models.ForeignKey(JobApplication, on_delete=models.CASCADE, related_name='interview_panels')
     remarks = models.TextField(max_length=500, blank=True, null=True)
     result = models.CharField(
-        max_length=20, blank=True, null=True,
-        help_text="SELECTED / REJECTED / WAITLISTED"
+        max_length=20,
+        choices=Constants.INTERVIEW_RESULT,
+        default='PENDING',
+        help_text="PENDING / SELECTED / REJECTED / WAITLISTED"
     )
 
     class Meta:
@@ -729,4 +766,217 @@ class PlacementPolicy(models.Model):
 
     def __str__(self):
         return self.name
+
+class Appeal(models.Model):
+    """
+    Appeals by students against placement decisions (e.g., interview rejections).
+    """
+    application = models.ForeignKey(JobApplication, on_delete=models.CASCADE, related_name='appeals')
+    reason = models.TextField(max_length=2000, help_text="Reason for the appeal")
+    status = models.CharField(
+        max_length=20,
+        choices=(('PENDING', 'Pending'), ('RESOLVED', 'Resolved'), ('REJECTED', 'Rejected')),
+        default='PENDING'
+    )
+    remarks = models.TextField(max_length=2000, blank=True, null=True, help_text="TPO remarks on resolution")
+    created_at = models.DateTimeField(auto_now_add=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return 'Appeal by {} for {} ({})'.format(
+            self.application.student.id.user.username,
+            self.application.job_posting.company.name,
+            self.status
+        )
+
+class PlacementProfile(models.Model):
+    student = models.OneToOneField(Student, on_delete=models.CASCADE, related_name='placement_profile')
+    resume = models.FileField(upload_to='placement_resumes/', blank=True, null=True)
+    about_me = models.TextField(blank=True, null=True)
+    linkedin_url = models.URLField(max_length=500, blank=True, null=True)
+    github_url = models.URLField(max_length=500, blank=True, null=True)
+    portfolio_url = models.URLField(max_length=500, blank=True, null=True)
+    achievements = models.JSONField(default=list, blank=True, null=True)
+    certifications = models.JSONField(default=list, blank=True, null=True)
+
+    def __str__(self):
+        return f"{self.student.id.user.username}'s Placement Profile"
+
+
+class PlacementProfileAuditLog(models.Model):
+    profile = models.ForeignKey(PlacementProfile, on_delete=models.CASCADE, related_name='audit_logs')
+    changed_at = models.DateTimeField(auto_now_add=True)
+    changed_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
+    changes = models.JSONField()
+
+    def __str__(self):
+        return f"Log for {self.profile} at {self.changed_at}"
+
+
+# =============================================
+# ALUMNI NETWORK MODELS
+# =============================================
+
+class AlumniProfile(models.Model):
+    """
+    Represents an alumni who has registered on the placement system.
+    Alumni self-register and are subject to TPO approval before they
+    can access mentorship and job-referral features.
+    """
+    APPROVAL_CHOICES = (
+        ('PENDING', 'Pending'),
+        ('APPROVED', 'Approved'),
+        ('REJECTED', 'Rejected'),
+    )
+
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='alumni_profile')
+    graduation_year = models.IntegerField(help_text="Year of graduation")
+    programme = models.CharField(max_length=50, blank=True, null=True,
+                                 help_text="e.g. B.Tech, M.Tech, B.Des, PhD")
+    department = models.CharField(max_length=100, blank=True, null=True,
+                                  help_text="Department at the time of graduation")
+    current_company = models.CharField(max_length=200, blank=True, null=True)
+    current_designation = models.CharField(max_length=200, blank=True, null=True)
+    linkedin_url = models.URLField(max_length=500, blank=True, null=True)
+    phone = models.CharField(max_length=20, blank=True, null=True)
+    bio = models.TextField(max_length=2000, blank=True, null=True)
+    verification_document = models.FileField(
+        upload_to='placement/alumni_verification/', blank=True, null=True,
+        help_text="Upload degree certificate or ID for verification"
+    )
+    approval_status = models.CharField(
+        max_length=20, choices=APPROVAL_CHOICES, default='PENDING'
+    )
+    approved_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='approved_alumni'
+    )
+    rejection_remarks = models.TextField(max_length=1000, blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name_plural = "Alumni Profiles"
+
+    def __str__(self):
+        return f"{self.user.first_name} {self.user.last_name} ({self.graduation_year})"
+
+    @property
+    def full_name(self):
+        return f"{self.user.first_name} {self.user.last_name}".strip()
+
+    @property
+    def is_approved(self):
+        return self.approval_status == 'APPROVED'
+
+
+class MentorshipProfile(models.Model):
+    """
+    An approved alumni can set up a mentorship profile to offer
+    guidance to current students.
+    """
+    alumni = models.OneToOneField(
+        AlumniProfile, on_delete=models.CASCADE, related_name='mentorship_profile'
+    )
+    is_available = models.BooleanField(default=True)
+    topics = models.JSONField(
+        default=list, blank=True,
+        help_text="List of topics the mentor can help with, e.g. ['Resume Review', 'DSA', 'System Design']"
+    )
+    availability_slots = models.JSONField(
+        default=list, blank=True,
+        help_text="Preferred time-slots, e.g. [{'day':'Monday','time':'18:00-19:00'}]"
+    )
+    max_sessions_per_month = models.IntegerField(default=4)
+    bio = models.TextField(max_length=1000, blank=True, null=True,
+                           help_text="Short mentorship-specific bio / what you can help with")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-updated_at']
+
+    def __str__(self):
+        return f"Mentor: {self.alumni.full_name}"
+
+
+class MentorshipSession(models.Model):
+    """
+    Tracks a mentorship session booked between a student and an alumni mentor.
+    """
+    SESSION_STATUS = (
+        ('REQUESTED', 'Requested'),
+        ('CONFIRMED', 'Confirmed'),
+        ('COMPLETED', 'Completed'),
+        ('CANCELLED', 'Cancelled'),
+    )
+
+    mentor = models.ForeignKey(
+        MentorshipProfile, on_delete=models.CASCADE, related_name='sessions'
+    )
+    student = models.ForeignKey(
+        Student, on_delete=models.CASCADE, related_name='mentorship_sessions'
+    )
+    topic = models.CharField(max_length=200)
+    message = models.TextField(max_length=1000, blank=True, null=True,
+                               help_text="Student's message to the mentor")
+    scheduled_date = models.DateField(null=True, blank=True)
+    scheduled_time = models.TimeField(null=True, blank=True)
+    duration_minutes = models.IntegerField(default=30)
+    meeting_link = models.URLField(max_length=500, blank=True, null=True)
+    status = models.CharField(max_length=20, choices=SESSION_STATUS, default='REQUESTED')
+    mentor_notes = models.TextField(max_length=1000, blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Session: {self.student.id.user.username} ↔ {self.mentor.alumni.full_name} ({self.status})"
+
+
+class JobReferral(models.Model):
+    """
+    Alumni can post job referral opportunities for current students.
+    """
+    posted_by = models.ForeignKey(
+        AlumniProfile, on_delete=models.CASCADE, related_name='referrals'
+    )
+    company_name = models.CharField(max_length=200)
+    role_title = models.CharField(max_length=200)
+    description = models.TextField(max_length=3000)
+    location = models.CharField(max_length=200, blank=True, null=True)
+    referral_link = models.URLField(max_length=500, blank=True, null=True,
+                                    help_text="Application / referral link")
+    ctc_range = models.CharField(max_length=100, blank=True, null=True,
+                                 help_text="e.g. 12-18 LPA")
+    eligible_programmes = models.CharField(
+        max_length=200, blank=True, null=True,
+        help_text="Comma-separated: B.Tech, M.Tech, B.Des, PhD"
+    )
+    eligible_branches = models.CharField(
+        max_length=300, blank=True, null=True,
+        help_text="Comma-separated: CSE, ECE, ME, DESIGN"
+    )
+    is_active = models.BooleanField(default=True)
+    deadline = models.DateField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.role_title} at {self.company_name} (by {self.posted_by.full_name})"
+
+    @property
+    def is_deadline_passed(self):
+        if self.deadline:
+            return datetime.date.today() > self.deadline
+        return False
 

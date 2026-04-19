@@ -10,6 +10,12 @@ router.register(r'job-postings', api_views.JobPostingViewSet, basename='jobposti
 router.register(r'job-applications', api_views.JobApplicationViewSet, basename='jobapplication')
 router.register(r'job-offers', api_views.JobOfferViewSet, basename='joboffer')
 router.register(r'announcements', api_views.AnnouncementViewSet, basename='announcement')
+router.register(r'appeals', api_views.AppealViewSet, basename='appeal')
+router.register(r'placement-profile', api_views.PlacementProfileViewSet, basename='placementprofile')
+router.register(r'alumni', api_views.AlumniProfileViewSet, basename='alumni')
+router.register(r'mentorship', api_views.MentorshipProfileViewSet, basename='mentorship')
+router.register(r'mentorship-sessions', api_views.MentorshipSessionViewSet, basename='mentorshipsession')
+router.register(r'job-referrals', api_views.JobReferralViewSet, basename='jobreferral')
 
 urlpatterns = [
     # 1. Role & Auth
@@ -71,7 +77,10 @@ urlpatterns = [
 
     # 15. Interviews
     url(r'^interviews/$', api_views.interviews_api, name='interviews_api'),
+    url(r'^interviews/check-conflicts/$', api_views.check_conflicts_api, name='check_conflicts_api'),
     url(r'^interviews/(?P<interview_id>\d+)/$', api_views.interview_detail_api, name='interview_detail_api'),
+    url(r'^interviews/(?P<interview_id>\d+)/assign-panel/$', api_views.assign_panel_api, name='assign_panel_api'),
+    url(r'^interviews/(?P<interview_id>\d+)/record-outcome/$', api_views.record_outcome_api, name='record_outcome_api'),
 ]
 
 urlpatterns += router.urls

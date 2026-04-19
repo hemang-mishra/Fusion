@@ -39,7 +39,8 @@ from applications.placement_cell.models import (
     Skill, StudentPlacement, StudentRecord, Role, CompanyDetails,
     Company, JobPosting, JobApplication, InterviewSchedule,
     InterviewPanel, JobOffer, Announcement, PlacementPolicy,
-    Coauthor, Coinventor,
+    Coauthor, Coinventor, Appeal, PlacementProfile, PlacementProfileAuditLog,
+    AlumniProfile, MentorshipProfile, MentorshipSession, JobReferral,
 )
 
 from applications.placement_cell.api.serializers import (
@@ -57,12 +58,17 @@ from applications.placement_cell.api.serializers import (
     InterviewScheduleSerializer, InterviewPanelSerializer,
     JobOfferSerializer,
     AnnouncementSerializer,
-    PlacementPolicySerializer,
+    PlacementPolicySerializer, PlacementProfileSerializer,
+    AppealSerializer,
+    AlumniProfileSerializer, AlumniProfileListSerializer,
+    MentorshipProfileSerializer, MentorshipSessionSerializer,
+    JobReferralSerializer,
 )
 
 # Import business logic services
 from applications.placement_cell.services import (
-    is_tpo_or_chairman, is_chairman, is_officer, is_student, get_student, get_user_roles,
+    is_tpo_or_chairman, is_chairman, is_officer, is_student, is_alumni,
+    get_student, get_alumni_profile, get_user_roles,
     check_invitation_date, create_placement_schedule, update_student_invitation,
     delete_placement_schedule, get_all_students_with_placement_info, get_student_cv_data,
     build_cv_context, get_placement_status_list, update_student_placement_status,
@@ -75,6 +81,8 @@ from applications.placement_cell.services import (
     create_interview_schedule, get_interview_details, get_placement_policies,
     create_or_update_policy, toggle_policy_active, get_all_roles, create_or_get_role,
     get_form_field_config, get_active_announcements,
+    approve_alumni, reject_alumni,
+    check_interview_conflicts, validate_reschedule,
 )
 
 
@@ -261,6 +269,24 @@ def cv_data_api(request, username):
     cv_data['conferences'] = ConferenceSerializer(cv_data['conferences'], many=True).data
     cv_data['publications'] = PublicationSerializer(cv_data['publications'], many=True).data
     cv_data['patents'] = PatentSerializer(cv_data['patents'], many=True).data
+
+    # Merge PlacementProfile social links so the frontend can build a rich resume
+    try:
+        from applications.globals.models import ExtraInfo as _ExtraInfo
+        from applications.academic_information.models import Student as _Student
+        _profile = _ExtraInfo.objects.get(user=target_user)
+        _student = _Student.objects.get(id=_profile)
+        pp = PlacementProfile.objects.get(student=_student)
+        cv_data['linkedin_url']  = pp.linkedin_url or ''
+        cv_data['github_url']    = pp.github_url or ''
+        cv_data['portfolio_url'] = pp.portfolio_url or ''
+        # Prefer PlacementProfile about_me if set, else fall back to ExtraInfo
+        if pp.about_me:
+            cv_data['profile']['about_me'] = pp.about_me
+    except Exception:
+        cv_data.setdefault('linkedin_url', '')
+        cv_data.setdefault('github_url', '')
+        cv_data.setdefault('portfolio_url', '')
 
     return Response(cv_data)
 
@@ -996,6 +1022,16 @@ class JobOfferViewSet(viewsets.ModelViewSet):
         except Student.DoesNotExist:
             return JobOffer.objects.none()
 
+    def perform_create(self, serializer):
+        from datetime import timedelta
+        # Auto-set response deadline to 48 hours if not provided
+        deadline = self.request.data.get('response_deadline')
+        if not deadline:
+            deadline = timezone.now() + timedelta(hours=48)
+            serializer.save(response_deadline=deadline)
+        else:
+            serializer.save()
+
     @action(detail=True, methods=['post'])
     def respond(self, request, pk=None):
         """Student accepts or rejects an offer."""
@@ -1005,6 +1041,50 @@ class JobOfferViewSet(viewsets.ModelViewSet):
         if success:
             return Response({'status': message})
         return Response({'error': message}, status=400)
+
+
+class AppealViewSet(viewsets.ModelViewSet):
+    """API endpoint for managing appeals."""
+    permission_classes = [IsAuthenticated]
+    serializer_class = AppealSerializer
+    queryset = Appeal.objects.all()
+
+    def get_queryset(self):
+        user = self.request.user
+        if is_tpo_or_chairman(user):
+            return Appeal.objects.all()
+        profile = get_object_or_404(ExtraInfo, user=user)
+        try:
+            student = Student.objects.get(id=profile)
+            return Appeal.objects.filter(application__student=student)
+        except Student.DoesNotExist:
+            return Appeal.objects.none()
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        profile = get_object_or_404(ExtraInfo, user=user)
+        student = get_object_or_404(Student, id=profile)
+        # Verify application belongs to student
+        application = get_object_or_404(JobApplication, id=self.request.data.get('application'), student=student)
+        serializer.save(application=application)
+
+    @action(detail=True, methods=['post'])
+    def resolve(self, request, pk=None):
+        if not is_tpo_or_chairman(request.user):
+            return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
+        appeal = self.get_object()
+        appeal.status = request.data.get('status', 'RESOLVED')
+        appeal.remarks = request.data.get('remarks', '')
+        appeal.resolved_at = timezone.now()
+        appeal.save()
+
+        # Optionally update application status
+        new_app_status = request.data.get('application_status')
+        if new_app_status:
+            appeal.application.status = new_app_status
+            appeal.application.save()
+
+        return Response(AppealSerializer(appeal).data)
 
 
 class AnnouncementViewSet(viewsets.ModelViewSet):
@@ -1175,9 +1255,22 @@ def policies_api(request):
 def interviews_api(request):
     """List or create interview schedules."""
     if request.method == 'GET':
-        interviews = InterviewSchedule.objects.select_related(
-            'job_posting', 'job_posting__company'
-        ).all().order_by('-date')
+        # Students only see interviews they're assigned to
+        if _is_student(request.user):
+            student = _get_student(request.user)
+            if student:
+                panel_interviews = InterviewPanel.objects.filter(
+                    application__student=student
+                ).values_list('interview_id', flat=True)
+                interviews = InterviewSchedule.objects.filter(
+                    id__in=panel_interviews
+                ).select_related('job_posting', 'job_posting__company').order_by('-date')
+            else:
+                interviews = InterviewSchedule.objects.none()
+        else:
+            interviews = InterviewSchedule.objects.select_related(
+                'job_posting', 'job_posting__company'
+            ).all().order_by('-date')
         return Response(InterviewScheduleSerializer(interviews, many=True).data)
 
     elif request.method == 'POST':
@@ -1186,16 +1279,40 @@ def interviews_api(request):
 
         serializer = InterviewScheduleSerializer(data=request.data)
         if serializer.is_valid():
+            # Compute end_time for conflict check
+            import datetime as dt
+            time_slot = serializer.validated_data.get('time_slot')
+            duration = serializer.validated_data.get('duration_minutes', 60)
+            venue = serializer.validated_data.get('venue_or_link', '')
+            interview_date = serializer.validated_data.get('date')
+
+            if time_slot and duration:
+                start_dt = dt.datetime.combine(dt.date.today(), time_slot)
+                end_time = (start_dt + dt.timedelta(minutes=duration)).time()
+            else:
+                end_time = None
+
+            # Check for conflicts
+            conflicts = check_interview_conflicts(
+                interview_date, time_slot, end_time, venue
+            )
+            if conflicts.exists():
+                conflict_data = InterviewScheduleSerializer(conflicts, many=True).data
+                return Response({
+                    'error': 'Scheduling conflict detected',
+                    'conflicts': conflict_data,
+                }, status=status.HTTP_409_CONFLICT)
+
             serializer.save(created_by=request.user)
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
-@api_view(['GET', 'PUT'])
+@api_view(['GET', 'PUT', 'DELETE'])
 @permission_classes([IsAuthenticated])
 @authentication_classes([TokenAuthentication])
 def interview_detail_api(request, interview_id):
-    """Get or update an interview schedule."""
+    """Get, update (reschedule), or delete an interview schedule."""
     interview = get_object_or_404(InterviewSchedule, id=interview_id)
 
     if request.method == 'GET':
@@ -1212,11 +1329,177 @@ def interview_detail_api(request, interview_id):
         if not _is_tpo_or_chairman(request.user):
             return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
 
+        # Detect if this is a reschedule (date or time changed)
+        new_date = request.data.get('date')
+        new_time = request.data.get('time_slot')
+        is_reschedule = False
+        if new_date and str(new_date) != str(interview.date):
+            is_reschedule = True
+        if new_time and str(new_time) != str(interview.time_slot):
+            is_reschedule = True
+
+        if is_reschedule:
+            can_reschedule, msg = validate_reschedule(interview)
+            if not can_reschedule:
+                return Response({'error': msg}, status=status.HTTP_400_BAD_REQUEST)
+
         serializer = InterviewScheduleSerializer(interview, data=request.data, partial=True)
         if serializer.is_valid():
+            # Conflict check for the new slot
+            import datetime as dt
+            check_date = serializer.validated_data.get('date', interview.date)
+            check_time = serializer.validated_data.get('time_slot', interview.time_slot)
+            check_duration = serializer.validated_data.get('duration_minutes', interview.duration_minutes)
+            check_venue = serializer.validated_data.get('venue_or_link', interview.venue_or_link)
+
+            if check_time and check_duration:
+                start_dt = dt.datetime.combine(dt.date.today(), check_time)
+                check_end = (start_dt + dt.timedelta(minutes=check_duration)).time()
+            else:
+                check_end = interview.end_time
+
+            conflicts = check_interview_conflicts(
+                check_date, check_time, check_end, check_venue,
+                exclude_id=interview.id
+            )
+            if conflicts.exists():
+                conflict_data = InterviewScheduleSerializer(conflicts, many=True).data
+                return Response({
+                    'error': 'Scheduling conflict detected',
+                    'conflicts': conflict_data,
+                }, status=status.HTTP_409_CONFLICT)
+
+            # Increment reschedule counter if date/time changed
+            if is_reschedule:
+                serializer.validated_data['reschedule_count'] = interview.reschedule_count + 1
+
             serializer.save()
             return Response(serializer.data)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    elif request.method == 'DELETE':
+        if not _is_tpo_or_chairman(request.user):
+            return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
+        interview.delete()
+        return Response({'detail': 'Interview deleted.'}, status=status.HTTP_204_NO_CONTENT)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+@authentication_classes([TokenAuthentication])
+def check_conflicts_api(request):
+    """
+    Preview conflicts for a proposed date/time/venue slot without creating.
+    Query params: date, time_slot, duration_minutes, venue_or_link, exclude_id (optional)
+    """
+    import datetime as dt
+    interview_date = request.query_params.get('date')
+    time_slot_str = request.query_params.get('time_slot')
+    duration = int(request.query_params.get('duration_minutes', 60))
+    venue = request.query_params.get('venue_or_link', '')
+    exclude_id = request.query_params.get('exclude_id')
+
+    if not interview_date or not time_slot_str:
+        return Response({'conflicts': [], 'has_conflicts': False})
+
+    try:
+        parsed_date = dt.datetime.strptime(interview_date, '%Y-%m-%d').date()
+        parsed_time = dt.datetime.strptime(time_slot_str, '%H:%M').time()
+    except ValueError:
+        return Response({'error': 'Invalid date or time format. Use YYYY-MM-DD and HH:MM.'},
+                        status=status.HTTP_400_BAD_REQUEST)
+
+    start_dt = dt.datetime.combine(dt.date.today(), parsed_time)
+    end_time = (start_dt + dt.timedelta(minutes=duration)).time()
+
+    conflicts = check_interview_conflicts(parsed_date, parsed_time, end_time, venue, exclude_id)
+    return Response({
+        'has_conflicts': conflicts.exists(),
+        'conflicts': InterviewScheduleSerializer(conflicts, many=True).data,
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@authentication_classes([TokenAuthentication])
+def assign_panel_api(request, interview_id):
+    """
+    Assign shortlisted students to an interview panel.
+    Body: { "application_ids": [1, 2, 3] }
+    """
+    if not _is_tpo_or_chairman(request.user):
+        return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
+
+    interview = get_object_or_404(InterviewSchedule, id=interview_id)
+    application_ids = request.data.get('application_ids', [])
+
+    if not application_ids:
+        return Response({'error': 'No application IDs provided.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    created = []
+    skipped = []
+    for app_id in application_ids:
+        try:
+            application = JobApplication.objects.get(id=app_id, job_posting=interview.job_posting)
+            _, was_created = InterviewPanel.objects.get_or_create(
+                interview=interview, application=application
+            )
+            if was_created:
+                created.append(app_id)
+            else:
+                skipped.append(app_id)
+        except JobApplication.DoesNotExist:
+            skipped.append(app_id)
+
+    panelists = InterviewPanel.objects.filter(interview=interview).select_related(
+        'application', 'application__student', 'application__student__id__user'
+    )
+    return Response({
+        'detail': f'{len(created)} assigned, {len(skipped)} skipped.',
+        'panelists': InterviewPanelSerializer(panelists, many=True).data,
+    })
+
+
+@api_view(['PUT'])
+@permission_classes([IsAuthenticated])
+@authentication_classes([TokenAuthentication])
+def record_outcome_api(request, interview_id):
+    """
+    Batch-update outcomes for an interview's panelists.
+    Body: { "outcomes": [ {"panel_id": 1, "result": "SELECTED", "remarks": "..."}, ... ] }
+    """
+    if not _is_tpo_or_chairman(request.user):
+        return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
+
+    interview = get_object_or_404(InterviewSchedule, id=interview_id)
+    outcomes = request.data.get('outcomes', [])
+
+    if not outcomes:
+        return Response({'error': 'No outcomes provided.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    updated = 0
+    for outcome in outcomes:
+        panel_id = outcome.get('panel_id')
+        result = outcome.get('result', '')
+        remarks = outcome.get('remarks', '')
+        try:
+            panel = InterviewPanel.objects.get(id=panel_id, interview=interview)
+            if result:
+                panel.result = result
+            if remarks:
+                panel.remarks = remarks
+            panel.save()
+            updated += 1
+        except InterviewPanel.DoesNotExist:
+            pass
+
+    panelists = InterviewPanel.objects.filter(interview=interview).select_related(
+        'application', 'application__student', 'application__student__id__user'
+    )
+    return Response({
+        'detail': f'{updated} outcomes recorded.',
+        'panelists': InterviewPanelSerializer(panelists, many=True).data,
+    })
 
 
 
@@ -1426,3 +1709,297 @@ def get_student_application_summary(student):
         'applications': applications,
     }
     return summary
+
+
+class PlacementProfileViewSet(viewsets.ModelViewSet):
+    serializer_class = PlacementProfileSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        # Admin can see all, student can see only theirs
+        user = self.request.user
+        if is_student(user):
+            student = get_object_or_404(Student, id__user=user)
+            return PlacementProfile.objects.filter(student=student)
+        return PlacementProfile.objects.all()
+
+    def list(self, request, *args, **kwargs):
+        if is_student(request.user):
+            # Create if doesn't exist
+            student = get_object_or_404(Student, id__user=request.user)
+            profile, created = PlacementProfile.objects.get_or_create(student=student)
+            serializer = self.get_serializer(profile)
+            return Response(serializer.data)
+
+        # otherwise return normal list
+        return super().list(request, *args, **kwargs)
+
+    def perform_update(self, serializer):
+        # Save old state for audit
+        instance = self.get_object()
+        old_data = self.get_serializer(instance).data
+
+        # Save the new state
+        new_instance = serializer.save()
+        new_data = self.get_serializer(new_instance).data
+
+        # Calculate differences and create audit log
+        changes = {}
+        # Only log fields that we care about
+        fields_to_track = ['resume', 'about_me', 'linkedin_url', 'portfolio_url',
+                           'github_url', 'achievements', 'certifications']
+
+        for field in fields_to_track:
+            old_value = old_data.get(field)
+            new_value = new_data.get(field)
+            if old_value != new_value:
+                changes[field] = {
+                    'old': old_value,
+                    'new': new_value
+                }
+
+        if changes:
+            PlacementProfileAuditLog.objects.create(
+                profile=new_instance,
+                changed_by=self.request.user,
+                changes=changes
+            )
+
+
+# =============================================
+# ALUMNI NETWORK VIEWSETS
+# =============================================
+
+class AlumniProfileViewSet(viewsets.ModelViewSet):
+    """
+    Alumni registration and profile management.
+    - Any authenticated user can POST to register as alumni.
+    - TPO/Chairman can list all alumni (filterable by status) and approve/reject.
+    - Students see only APPROVED alumni.
+    - Alumni can PATCH their own profile.
+    """
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [TokenAuthentication]
+
+    def get_serializer_class(self):
+        if self.action == 'list' and not is_tpo_or_chairman(self.request.user):
+            return AlumniProfileListSerializer
+        return AlumniProfileSerializer
+
+    def get_queryset(self):
+        user = self.request.user
+        if is_tpo_or_chairman(user):
+            qs = AlumniProfile.objects.all()
+            status_filter = self.request.query_params.get('status')
+            if status_filter:
+                qs = qs.filter(approval_status=status_filter.upper())
+            return qs
+        elif is_alumni(user):
+            return AlumniProfile.objects.filter(user=user)
+        else:
+            # Students & others see only approved alumni
+            return AlumniProfile.objects.filter(approval_status='APPROVED')
+
+    def perform_create(self, serializer):
+        # Check if the user already has an alumni profile
+        if AlumniProfile.objects.filter(user=self.request.user).exists():
+            raise serializers.ValidationError(
+                {'detail': 'You have already registered as an alumni.'}
+            )
+        serializer.save(user=self.request.user)
+
+    def perform_update(self, serializer):
+        instance = self.get_object()
+        if instance.user != self.request.user and not is_tpo_or_chairman(self.request.user):
+            raise serializers.ValidationError(
+                {'detail': 'You can only update your own profile.'}
+            )
+        serializer.save()
+
+    @action(detail=True, methods=['post'], url_path='approve')
+    def approve(self, request, pk=None):
+        """TPO/Chairman approves an alumni registration."""
+        if not is_tpo_or_chairman(request.user):
+            return Response({'detail': 'Not authorized.'}, status=status.HTTP_403_FORBIDDEN)
+        profile = self.get_object()
+        if profile.approval_status == 'APPROVED':
+            return Response({'detail': 'Already approved.'}, status=status.HTTP_400_BAD_REQUEST)
+        approve_alumni(profile, request.user)
+        return Response(AlumniProfileSerializer(profile).data)
+
+    @action(detail=True, methods=['post'], url_path='reject')
+    def reject(self, request, pk=None):
+        """TPO/Chairman rejects an alumni registration."""
+        if not is_tpo_or_chairman(request.user):
+            return Response({'detail': 'Not authorized.'}, status=status.HTTP_403_FORBIDDEN)
+        profile = self.get_object()
+        remarks = request.data.get('remarks', '')
+        reject_alumni(profile, remarks)
+        return Response(AlumniProfileSerializer(profile).data)
+
+    @action(detail=False, methods=['get'], url_path='me')
+    def me(self, request):
+        """Get the current user's alumni profile (or 404)."""
+        profile = get_alumni_profile(request.user)
+        if not profile:
+            return Response({'detail': 'No alumni profile found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(AlumniProfileSerializer(profile).data)
+
+
+class MentorshipProfileViewSet(viewsets.ModelViewSet):
+    """
+    Mentorship profile management.
+    - Alumni create/update their mentorship profile.
+    - Students & TPO can list available mentors.
+    """
+    serializer_class = MentorshipProfileSerializer
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [TokenAuthentication]
+
+    def get_queryset(self):
+        user = self.request.user
+        if is_alumni(user):
+            alumni = get_alumni_profile(user)
+            if alumni:
+                return MentorshipProfile.objects.filter(alumni=alumni)
+            return MentorshipProfile.objects.none()
+        # Students & TPO see available mentors only
+        qs = MentorshipProfile.objects.filter(
+            is_available=True,
+            alumni__approval_status='APPROVED'
+        )
+        return qs
+
+    def perform_create(self, serializer):
+        alumni = get_alumni_profile(self.request.user)
+        if not alumni or not alumni.is_approved:
+            raise serializers.ValidationError(
+                {'detail': 'Only approved alumni can create a mentorship profile.'}
+            )
+        if MentorshipProfile.objects.filter(alumni=alumni).exists():
+            raise serializers.ValidationError(
+                {'detail': 'You already have a mentorship profile. Use PATCH to update.'}
+            )
+        serializer.save(alumni=alumni)
+
+    def perform_update(self, serializer):
+        instance = self.get_object()
+        if instance.alumni.user != self.request.user:
+            raise serializers.ValidationError(
+                {'detail': 'You can only update your own mentorship profile.'}
+            )
+        serializer.save()
+
+
+class MentorshipSessionViewSet(viewsets.ModelViewSet):
+    """
+    Mentorship session booking.
+    - Students create (request) sessions.
+    - Mentors confirm/cancel and add meeting link.
+    - Both parties list their sessions.
+    """
+    serializer_class = MentorshipSessionSerializer
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [TokenAuthentication]
+
+    def get_queryset(self):
+        user = self.request.user
+        if is_alumni(user):
+            alumni = get_alumni_profile(user)
+            if alumni:
+                try:
+                    mp = alumni.mentorship_profile
+                    return MentorshipSession.objects.filter(mentor=mp)
+                except MentorshipProfile.DoesNotExist:
+                    pass
+            return MentorshipSession.objects.none()
+        elif is_student(user):
+            student = get_student(user)
+            if student:
+                return MentorshipSession.objects.filter(student=student)
+            return MentorshipSession.objects.none()
+        elif is_tpo_or_chairman(user):
+            return MentorshipSession.objects.all()
+        return MentorshipSession.objects.none()
+
+    def perform_create(self, serializer):
+        student = get_student(self.request.user)
+        if not student:
+            raise serializers.ValidationError(
+                {'detail': 'Only students can request mentorship sessions.'}
+            )
+        serializer.save(student=student)
+
+    def perform_update(self, serializer):
+        instance = self.get_object()
+        user = self.request.user
+        # Mentor can update status, meeting_link, mentor_notes
+        if is_alumni(user) and instance.mentor.alumni.user == user:
+            serializer.save()
+        elif is_student(user) and instance.student.id.user == user:
+            # Student can only cancel
+            if serializer.validated_data.get('status') not in (None, 'CANCELLED'):
+                raise serializers.ValidationError(
+                    {'detail': 'Students can only cancel sessions.'}
+                )
+            serializer.save()
+        elif is_tpo_or_chairman(user):
+            serializer.save()
+        else:
+            raise serializers.ValidationError(
+                {'detail': 'Not authorized to update this session.'}
+            )
+
+
+class JobReferralViewSet(viewsets.ModelViewSet):
+    """
+    Job referral postings by alumni.
+    - Alumni CRUD their own referrals.
+    - Students list active referrals.
+    - TPO can moderate (delete).
+    """
+    serializer_class = JobReferralSerializer
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [TokenAuthentication]
+
+    def get_queryset(self):
+        user = self.request.user
+        if is_alumni(user):
+            alumni = get_alumni_profile(user)
+            if alumni:
+                return JobReferral.objects.filter(posted_by=alumni)
+            return JobReferral.objects.none()
+        elif is_tpo_or_chairman(user):
+            return JobReferral.objects.all()
+        else:
+            # Students see only active, non-expired referrals
+            from datetime import date as _date
+            return JobReferral.objects.filter(
+                is_active=True
+            ).filter(
+                Q(deadline__isnull=True) | Q(deadline__gte=_date.today())
+            )
+
+    def perform_create(self, serializer):
+        alumni = get_alumni_profile(self.request.user)
+        if not alumni or not alumni.is_approved:
+            raise serializers.ValidationError(
+                {'detail': 'Only approved alumni can post job referrals.'}
+            )
+        serializer.save(posted_by=alumni)
+
+    def perform_update(self, serializer):
+        instance = self.get_object()
+        if instance.posted_by.user != self.request.user and not is_tpo_or_chairman(self.request.user):
+            raise serializers.ValidationError(
+                {'detail': 'You can only update your own referrals.'}
+            )
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        if instance.posted_by.user != self.request.user and not is_tpo_or_chairman(self.request.user):
+            raise serializers.ValidationError(
+                {'detail': 'You can only delete your own referrals.'}
+            )
+        instance.delete()
+

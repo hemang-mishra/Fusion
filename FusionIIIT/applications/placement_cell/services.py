@@ -11,7 +11,7 @@ from django.db.models import Avg, Count, Max, Min, Q, Sum
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 
-from applications.globals.models import ExtraInfo, HoldsDesignation
+from applications.globals.models import ExtraInfo, HoldsDesignation, Designation
 from applications.academic_information.models import Student
 
 from applications.placement_cell.models import (
@@ -21,7 +21,7 @@ from applications.placement_cell.models import (
     Skill, StudentPlacement, StudentRecord, Role, CompanyDetails,
     Company, JobPosting, JobApplication, InterviewSchedule,
     InterviewPanel, JobOffer, Announcement, PlacementPolicy,
-    Coauthor, Coinventor,
+    Coauthor, Coinventor, AlumniProfile,
 )
 
 
@@ -61,12 +61,27 @@ def is_student(user):
     ).exists()
 
 
+def is_alumni(user):
+    """Check if user is a verified alumni."""
+    return HoldsDesignation.objects.filter(
+        Q(working=user, designation__name="alumni")
+    ).exists()
+
+
 def get_student(user):
     """Get the Student object for a user. Returns None if not a student."""
     try:
         profile = ExtraInfo.objects.get(user=user)
         return Student.objects.get(id=profile)
     except (ExtraInfo.DoesNotExist, Student.DoesNotExist):
+        return None
+
+
+def get_alumni_profile(user):
+    """Get the AlumniProfile for a user. Returns None if not registered."""
+    try:
+        return AlumniProfile.objects.get(user=user)
+    except AlumniProfile.DoesNotExist:
         return None
 
 
@@ -78,12 +93,15 @@ def get_user_roles(user):
     is_chairman_val = is_chairman(user)
     is_officer_val = is_officer(user)
     is_student_val = is_student(user)
+    is_alumni_val = is_alumni(user)
 
     role = 'other'
     if is_chairman_val:
         role = 'placement chairman'
     elif is_officer_val:
         role = 'placement officer'
+    elif is_alumni_val:
+        role = 'alumni'
     elif is_student_val:
         role = 'student'
 
@@ -92,6 +110,7 @@ def get_user_roles(user):
         'is_chairman': is_chairman_val,
         'is_officer': is_officer_val,
         'is_student': is_student_val,
+        'is_alumni': is_alumni_val,
     }
 
 
@@ -685,6 +704,15 @@ def process_offer_response(offer, action_type):
         return False, 'Offer already {}'.format(offer.status)
 
     if action_type == 'accept':
+        if timezone.now() > offer.response_deadline:
+            offer.status = 'EXPIRED'
+            offer.save()
+            return False, 'The 48-hour decision deadline has passed.'
+
+        student = offer.application.student
+        if JobOffer.objects.filter(application__student=student, status='ACCEPTED').exists():
+            return False, 'You can hold only one accepted offer at a time.'
+
         offer.status = 'ACCEPTED'
         offer.responded_at = timezone.now()
         offer.save()
@@ -692,7 +720,6 @@ def process_offer_response(offer, action_type):
         offer.application.save()
 
         # Update StudentPlacement
-        student = offer.application.student
         sp, created = StudentPlacement.objects.get_or_create(unique_id=student)
         sp.placed_type = 'PLACED'
         sp.placement_date = datetime.date.today()
@@ -702,6 +729,11 @@ def process_offer_response(offer, action_type):
         return True, 'accepted'
 
     elif action_type == 'reject':
+        if timezone.now() > offer.response_deadline:
+            offer.status = 'EXPIRED'
+            offer.save()
+            return False, 'The 48-hour decision deadline has passed.'
+
         offer.status = 'REJECTED'
         offer.responded_at = timezone.now()
         offer.save()
@@ -944,3 +976,93 @@ def get_active_announcements(limit=None):
         qs = qs[:limit]
     return qs
 
+
+# =============================================
+# ALUMNI SERVICES
+# =============================================
+
+def approve_alumni(alumni_profile, approver):
+    """
+    Approve an alumni profile and grant the 'alumni' designation.
+    Creates a HoldsDesignation entry so is_alumni() returns True.
+    """
+    alumni_profile.approval_status = 'APPROVED'
+    alumni_profile.approved_by = approver
+    alumni_profile.rejection_remarks = None
+    alumni_profile.save()
+
+    # Ensure 'alumni' designation exists
+    designation, _ = Designation.objects.get_or_create(
+        name='alumni',
+        defaults={'full_name': 'Alumni', 'type': 'administrative'}
+    )
+
+    # Grant the designation to the alumni user
+    HoldsDesignation.objects.get_or_create(
+        user=alumni_profile.user,
+        designation=designation,
+        defaults={'working': alumni_profile.user}
+    )
+
+    return alumni_profile
+
+
+def reject_alumni(alumni_profile, remarks=''):
+    """Reject an alumni registration."""
+    alumni_profile.approval_status = 'REJECTED'
+    alumni_profile.rejection_remarks = remarks
+    alumni_profile.save()
+    return alumni_profile
+
+
+# =============================================
+# INTERVIEW SCHEDULING SERVICES
+# =============================================
+
+MAX_RESCHEDULES = 2
+
+
+def check_interview_conflicts(interview_date, time_slot, end_time, venue_or_link, exclude_id=None):
+    """
+    Check for scheduling conflicts: overlapping time ranges on the same date
+    AND same venue. Returns a queryset of conflicting InterviewSchedule objects.
+
+    Two interviews conflict if:
+      - Same date
+      - Same venue (case-insensitive, stripped)
+      - Time ranges overlap: new_start < existing_end AND new_end > existing_start
+    """
+    if not venue_or_link or not end_time:
+        return InterviewSchedule.objects.none()
+
+    qs = InterviewSchedule.objects.filter(
+        date=interview_date,
+        venue_or_link__iexact=venue_or_link.strip(),
+    ).exclude(
+        end_time__isnull=True,
+    )
+
+    if exclude_id:
+        qs = qs.exclude(id=exclude_id)
+
+    # Overlap condition: new_start < existing_end AND new_end > existing_start
+    conflicts = qs.filter(
+        time_slot__lt=end_time,
+        end_time__gt=time_slot,
+    )
+
+    return conflicts
+
+
+def validate_reschedule(interview):
+    """
+    Check whether an interview can be rescheduled.
+    Returns (can_reschedule: bool, message: str).
+    """
+    if interview.reschedule_count >= MAX_RESCHEDULES:
+        return False, (
+            f"This interview has already been rescheduled {interview.reschedule_count} times. "
+            f"Maximum {MAX_RESCHEDULES} reschedules allowed. "
+            "Please delete and create a new interview instead."
+        )
+    return True, f"Reschedule allowed ({interview.reschedule_count}/{MAX_RESCHEDULES} used)."
