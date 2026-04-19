@@ -82,6 +82,7 @@ from applications.placement_cell.services import (
     create_or_update_policy, toggle_policy_active, get_all_roles, create_or_get_role,
     get_form_field_config, get_active_announcements,
     approve_alumni, reject_alumni,
+    check_interview_conflicts, validate_reschedule,
 )
 
 
@@ -1021,6 +1022,16 @@ class JobOfferViewSet(viewsets.ModelViewSet):
         except Student.DoesNotExist:
             return JobOffer.objects.none()
 
+    def perform_create(self, serializer):
+        from datetime import timedelta
+        # Auto-set response deadline to 48 hours if not provided
+        deadline = self.request.data.get('response_deadline')
+        if not deadline:
+            deadline = timezone.now() + timedelta(hours=48)
+            serializer.save(response_deadline=deadline)
+        else:
+            serializer.save()
+
     @action(detail=True, methods=['post'])
     def respond(self, request, pk=None):
         """Student accepts or rejects an offer."""
@@ -1244,9 +1255,22 @@ def policies_api(request):
 def interviews_api(request):
     """List or create interview schedules."""
     if request.method == 'GET':
-        interviews = InterviewSchedule.objects.select_related(
-            'job_posting', 'job_posting__company'
-        ).all().order_by('-date')
+        # Students only see interviews they're assigned to
+        if _is_student(request.user):
+            student = _get_student(request.user)
+            if student:
+                panel_interviews = InterviewPanel.objects.filter(
+                    application__student=student
+                ).values_list('interview_id', flat=True)
+                interviews = InterviewSchedule.objects.filter(
+                    id__in=panel_interviews
+                ).select_related('job_posting', 'job_posting__company').order_by('-date')
+            else:
+                interviews = InterviewSchedule.objects.none()
+        else:
+            interviews = InterviewSchedule.objects.select_related(
+                'job_posting', 'job_posting__company'
+            ).all().order_by('-date')
         return Response(InterviewScheduleSerializer(interviews, many=True).data)
 
     elif request.method == 'POST':
@@ -1255,16 +1279,40 @@ def interviews_api(request):
 
         serializer = InterviewScheduleSerializer(data=request.data)
         if serializer.is_valid():
+            # Compute end_time for conflict check
+            import datetime as dt
+            time_slot = serializer.validated_data.get('time_slot')
+            duration = serializer.validated_data.get('duration_minutes', 60)
+            venue = serializer.validated_data.get('venue_or_link', '')
+            interview_date = serializer.validated_data.get('date')
+
+            if time_slot and duration:
+                start_dt = dt.datetime.combine(dt.date.today(), time_slot)
+                end_time = (start_dt + dt.timedelta(minutes=duration)).time()
+            else:
+                end_time = None
+
+            # Check for conflicts
+            conflicts = check_interview_conflicts(
+                interview_date, time_slot, end_time, venue
+            )
+            if conflicts.exists():
+                conflict_data = InterviewScheduleSerializer(conflicts, many=True).data
+                return Response({
+                    'error': 'Scheduling conflict detected',
+                    'conflicts': conflict_data,
+                }, status=status.HTTP_409_CONFLICT)
+
             serializer.save(created_by=request.user)
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
-@api_view(['GET', 'PUT'])
+@api_view(['GET', 'PUT', 'DELETE'])
 @permission_classes([IsAuthenticated])
 @authentication_classes([TokenAuthentication])
 def interview_detail_api(request, interview_id):
-    """Get or update an interview schedule."""
+    """Get, update (reschedule), or delete an interview schedule."""
     interview = get_object_or_404(InterviewSchedule, id=interview_id)
 
     if request.method == 'GET':
@@ -1281,11 +1329,177 @@ def interview_detail_api(request, interview_id):
         if not _is_tpo_or_chairman(request.user):
             return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
 
+        # Detect if this is a reschedule (date or time changed)
+        new_date = request.data.get('date')
+        new_time = request.data.get('time_slot')
+        is_reschedule = False
+        if new_date and str(new_date) != str(interview.date):
+            is_reschedule = True
+        if new_time and str(new_time) != str(interview.time_slot):
+            is_reschedule = True
+
+        if is_reschedule:
+            can_reschedule, msg = validate_reschedule(interview)
+            if not can_reschedule:
+                return Response({'error': msg}, status=status.HTTP_400_BAD_REQUEST)
+
         serializer = InterviewScheduleSerializer(interview, data=request.data, partial=True)
         if serializer.is_valid():
+            # Conflict check for the new slot
+            import datetime as dt
+            check_date = serializer.validated_data.get('date', interview.date)
+            check_time = serializer.validated_data.get('time_slot', interview.time_slot)
+            check_duration = serializer.validated_data.get('duration_minutes', interview.duration_minutes)
+            check_venue = serializer.validated_data.get('venue_or_link', interview.venue_or_link)
+
+            if check_time and check_duration:
+                start_dt = dt.datetime.combine(dt.date.today(), check_time)
+                check_end = (start_dt + dt.timedelta(minutes=check_duration)).time()
+            else:
+                check_end = interview.end_time
+
+            conflicts = check_interview_conflicts(
+                check_date, check_time, check_end, check_venue,
+                exclude_id=interview.id
+            )
+            if conflicts.exists():
+                conflict_data = InterviewScheduleSerializer(conflicts, many=True).data
+                return Response({
+                    'error': 'Scheduling conflict detected',
+                    'conflicts': conflict_data,
+                }, status=status.HTTP_409_CONFLICT)
+
+            # Increment reschedule counter if date/time changed
+            if is_reschedule:
+                serializer.validated_data['reschedule_count'] = interview.reschedule_count + 1
+
             serializer.save()
             return Response(serializer.data)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    elif request.method == 'DELETE':
+        if not _is_tpo_or_chairman(request.user):
+            return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
+        interview.delete()
+        return Response({'detail': 'Interview deleted.'}, status=status.HTTP_204_NO_CONTENT)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+@authentication_classes([TokenAuthentication])
+def check_conflicts_api(request):
+    """
+    Preview conflicts for a proposed date/time/venue slot without creating.
+    Query params: date, time_slot, duration_minutes, venue_or_link, exclude_id (optional)
+    """
+    import datetime as dt
+    interview_date = request.query_params.get('date')
+    time_slot_str = request.query_params.get('time_slot')
+    duration = int(request.query_params.get('duration_minutes', 60))
+    venue = request.query_params.get('venue_or_link', '')
+    exclude_id = request.query_params.get('exclude_id')
+
+    if not interview_date or not time_slot_str:
+        return Response({'conflicts': [], 'has_conflicts': False})
+
+    try:
+        parsed_date = dt.datetime.strptime(interview_date, '%Y-%m-%d').date()
+        parsed_time = dt.datetime.strptime(time_slot_str, '%H:%M').time()
+    except ValueError:
+        return Response({'error': 'Invalid date or time format. Use YYYY-MM-DD and HH:MM.'},
+                        status=status.HTTP_400_BAD_REQUEST)
+
+    start_dt = dt.datetime.combine(dt.date.today(), parsed_time)
+    end_time = (start_dt + dt.timedelta(minutes=duration)).time()
+
+    conflicts = check_interview_conflicts(parsed_date, parsed_time, end_time, venue, exclude_id)
+    return Response({
+        'has_conflicts': conflicts.exists(),
+        'conflicts': InterviewScheduleSerializer(conflicts, many=True).data,
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@authentication_classes([TokenAuthentication])
+def assign_panel_api(request, interview_id):
+    """
+    Assign shortlisted students to an interview panel.
+    Body: { "application_ids": [1, 2, 3] }
+    """
+    if not _is_tpo_or_chairman(request.user):
+        return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
+
+    interview = get_object_or_404(InterviewSchedule, id=interview_id)
+    application_ids = request.data.get('application_ids', [])
+
+    if not application_ids:
+        return Response({'error': 'No application IDs provided.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    created = []
+    skipped = []
+    for app_id in application_ids:
+        try:
+            application = JobApplication.objects.get(id=app_id, job_posting=interview.job_posting)
+            _, was_created = InterviewPanel.objects.get_or_create(
+                interview=interview, application=application
+            )
+            if was_created:
+                created.append(app_id)
+            else:
+                skipped.append(app_id)
+        except JobApplication.DoesNotExist:
+            skipped.append(app_id)
+
+    panelists = InterviewPanel.objects.filter(interview=interview).select_related(
+        'application', 'application__student', 'application__student__id__user'
+    )
+    return Response({
+        'detail': f'{len(created)} assigned, {len(skipped)} skipped.',
+        'panelists': InterviewPanelSerializer(panelists, many=True).data,
+    })
+
+
+@api_view(['PUT'])
+@permission_classes([IsAuthenticated])
+@authentication_classes([TokenAuthentication])
+def record_outcome_api(request, interview_id):
+    """
+    Batch-update outcomes for an interview's panelists.
+    Body: { "outcomes": [ {"panel_id": 1, "result": "SELECTED", "remarks": "..."}, ... ] }
+    """
+    if not _is_tpo_or_chairman(request.user):
+        return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
+
+    interview = get_object_or_404(InterviewSchedule, id=interview_id)
+    outcomes = request.data.get('outcomes', [])
+
+    if not outcomes:
+        return Response({'error': 'No outcomes provided.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    updated = 0
+    for outcome in outcomes:
+        panel_id = outcome.get('panel_id')
+        result = outcome.get('result', '')
+        remarks = outcome.get('remarks', '')
+        try:
+            panel = InterviewPanel.objects.get(id=panel_id, interview=interview)
+            if result:
+                panel.result = result
+            if remarks:
+                panel.remarks = remarks
+            panel.save()
+            updated += 1
+        except InterviewPanel.DoesNotExist:
+            pass
+
+    panelists = InterviewPanel.objects.filter(interview=interview).select_related(
+        'application', 'application__student', 'application__student__id__user'
+    )
+    return Response({
+        'detail': f'{updated} outcomes recorded.',
+        'panelists': InterviewPanelSerializer(panelists, many=True).data,
+    })
 
 
 
@@ -1500,7 +1714,7 @@ def get_student_application_summary(student):
 class PlacementProfileViewSet(viewsets.ModelViewSet):
     serializer_class = PlacementProfileSerializer
     permission_classes = [IsAuthenticated]
-    
+
     def get_queryset(self):
         # Admin can see all, student can see only theirs
         user = self.request.user
@@ -1516,7 +1730,7 @@ class PlacementProfileViewSet(viewsets.ModelViewSet):
             profile, created = PlacementProfile.objects.get_or_create(student=student)
             serializer = self.get_serializer(profile)
             return Response(serializer.data)
-        
+
         # otherwise return normal list
         return super().list(request, *args, **kwargs)
 
@@ -1524,17 +1738,17 @@ class PlacementProfileViewSet(viewsets.ModelViewSet):
         # Save old state for audit
         instance = self.get_object()
         old_data = self.get_serializer(instance).data
-        
+
         # Save the new state
         new_instance = serializer.save()
         new_data = self.get_serializer(new_instance).data
-        
+
         # Calculate differences and create audit log
         changes = {}
         # Only log fields that we care about
-        fields_to_track = ['resume', 'about_me', 'linkedin_url', 'portfolio_url', 
+        fields_to_track = ['resume', 'about_me', 'linkedin_url', 'portfolio_url',
                            'github_url', 'achievements', 'certifications']
-        
+
         for field in fields_to_track:
             old_value = old_data.get(field)
             new_value = new_data.get(field)
@@ -1543,7 +1757,7 @@ class PlacementProfileViewSet(viewsets.ModelViewSet):
                     'old': old_value,
                     'new': new_value
                 }
-                
+
         if changes:
             PlacementProfileAuditLog.objects.create(
                 profile=new_instance,

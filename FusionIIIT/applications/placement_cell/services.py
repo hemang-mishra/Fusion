@@ -704,6 +704,15 @@ def process_offer_response(offer, action_type):
         return False, 'Offer already {}'.format(offer.status)
 
     if action_type == 'accept':
+        if timezone.now() > offer.response_deadline:
+            offer.status = 'EXPIRED'
+            offer.save()
+            return False, 'The 48-hour decision deadline has passed.'
+
+        student = offer.application.student
+        if JobOffer.objects.filter(application__student=student, status='ACCEPTED').exists():
+            return False, 'You can hold only one accepted offer at a time.'
+
         offer.status = 'ACCEPTED'
         offer.responded_at = timezone.now()
         offer.save()
@@ -711,7 +720,6 @@ def process_offer_response(offer, action_type):
         offer.application.save()
 
         # Update StudentPlacement
-        student = offer.application.student
         sp, created = StudentPlacement.objects.get_or_create(unique_id=student)
         sp.placed_type = 'PLACED'
         sp.placement_date = datetime.date.today()
@@ -721,6 +729,11 @@ def process_offer_response(offer, action_type):
         return True, 'accepted'
 
     elif action_type == 'reject':
+        if timezone.now() > offer.response_deadline:
+            offer.status = 'EXPIRED'
+            offer.save()
+            return False, 'The 48-hour decision deadline has passed.'
+
         offer.status = 'REJECTED'
         offer.responded_at = timezone.now()
         offer.save()
@@ -1001,3 +1014,55 @@ def reject_alumni(alumni_profile, remarks=''):
     alumni_profile.save()
     return alumni_profile
 
+
+# =============================================
+# INTERVIEW SCHEDULING SERVICES
+# =============================================
+
+MAX_RESCHEDULES = 2
+
+
+def check_interview_conflicts(interview_date, time_slot, end_time, venue_or_link, exclude_id=None):
+    """
+    Check for scheduling conflicts: overlapping time ranges on the same date
+    AND same venue. Returns a queryset of conflicting InterviewSchedule objects.
+
+    Two interviews conflict if:
+      - Same date
+      - Same venue (case-insensitive, stripped)
+      - Time ranges overlap: new_start < existing_end AND new_end > existing_start
+    """
+    if not venue_or_link or not end_time:
+        return InterviewSchedule.objects.none()
+
+    qs = InterviewSchedule.objects.filter(
+        date=interview_date,
+        venue_or_link__iexact=venue_or_link.strip(),
+    ).exclude(
+        end_time__isnull=True,
+    )
+
+    if exclude_id:
+        qs = qs.exclude(id=exclude_id)
+
+    # Overlap condition: new_start < existing_end AND new_end > existing_start
+    conflicts = qs.filter(
+        time_slot__lt=end_time,
+        end_time__gt=time_slot,
+    )
+
+    return conflicts
+
+
+def validate_reschedule(interview):
+    """
+    Check whether an interview can be rescheduled.
+    Returns (can_reschedule: bool, message: str).
+    """
+    if interview.reschedule_count >= MAX_RESCHEDULES:
+        return False, (
+            f"This interview has already been rescheduled {interview.reschedule_count} times. "
+            f"Maximum {MAX_RESCHEDULES} reschedules allowed. "
+            "Please delete and create a new interview instead."
+        )
+    return True, f"Reschedule allowed ({interview.reschedule_count}/{MAX_RESCHEDULES} used)."

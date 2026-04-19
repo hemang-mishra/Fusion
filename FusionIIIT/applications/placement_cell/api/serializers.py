@@ -345,15 +345,20 @@ class JobApplicationSerializer(serializers.ModelSerializer):
 class InterviewScheduleSerializer(serializers.ModelSerializer):
     job_title = serializers.CharField(source='job_posting.title', read_only=True)
     company_name = serializers.CharField(source='job_posting.company.name', read_only=True)
+    panelist_count = serializers.SerializerMethodField()
 
     class Meta:
         model = InterviewSchedule
         fields = '__all__'
-        read_only_fields = ('created_by', 'created_at')
+        read_only_fields = ('created_by', 'created_at', 'end_time', 'reschedule_count')
+
+    def get_panelist_count(self, obj):
+        return obj.panelists.count()
 
 
 class InterviewPanelSerializer(serializers.ModelSerializer):
     student_name = serializers.SerializerMethodField()
+    student_roll = serializers.SerializerMethodField()
 
     class Meta:
         model = InterviewPanel
@@ -362,6 +367,9 @@ class InterviewPanelSerializer(serializers.ModelSerializer):
     def get_student_name(self, obj):
         user = obj.application.student.id.user
         return '{} {}'.format(user.first_name, user.last_name)
+
+    def get_student_roll(self, obj):
+        return obj.application.student.id.id
 
 
 class JobOfferSerializer(serializers.ModelSerializer):
@@ -373,6 +381,7 @@ class JobOfferSerializer(serializers.ModelSerializer):
         source='application.job_posting.title', read_only=True
     )
     is_deadline_passed = serializers.BooleanField(read_only=True)
+    response_deadline = serializers.DateTimeField(required=False)
 
     class Meta:
         model = JobOffer
@@ -456,11 +465,11 @@ class PlacementProfileSerializer(serializers.ModelSerializer):
     username = serializers.CharField(source='student.id.user.username', read_only=True)
     first_name = serializers.CharField(source='student.id.user.first_name', read_only=True)
     last_name = serializers.CharField(source='student.id.user.last_name', read_only=True)
-    
+
     class Meta:
         model = PlacementProfile
         fields = [
-            'id', 'student', 'username', 'first_name', 'last_name', 'resume', 'about_me', 'linkedin_url', 
+            'id', 'student', 'username', 'first_name', 'last_name', 'resume', 'about_me', 'linkedin_url',
             'github_url', 'portfolio_url', 'achievements', 'certifications',
             'audit_logs'
         ]
@@ -470,11 +479,11 @@ class PlacementProfileSerializer(serializers.ModelSerializer):
         from django.core.exceptions import ValidationError
         if not value:
             return value
-        
+
         # Max size 5MB
         if value.size > 5 * 1024 * 1024:
             raise ValidationError("Resume file size cannot exceed 5MB.")
-        
+
         # Check extensions
         import os
         ext = os.path.splitext(value.name)[1].lower()

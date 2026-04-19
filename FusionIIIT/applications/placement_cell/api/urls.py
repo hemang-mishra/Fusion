@@ -77,7 +77,10 @@ urlpatterns = [
 
     # 15. Interviews
     url(r'^interviews/$', api_views.interviews_api, name='interviews_api'),
+    url(r'^interviews/check-conflicts/$', api_views.check_conflicts_api, name='check_conflicts_api'),
     url(r'^interviews/(?P<interview_id>\d+)/$', api_views.interview_detail_api, name='interview_detail_api'),
+    url(r'^interviews/(?P<interview_id>\d+)/assign-panel/$', api_views.assign_panel_api, name='assign_panel_api'),
+    url(r'^interviews/(?P<interview_id>\d+)/record-outcome/$', api_views.record_outcome_api, name='record_outcome_api'),
 ]
 
 urlpatterns += router.urls

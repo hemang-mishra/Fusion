@@ -111,6 +111,13 @@ class Constants:
         ('OFFLINE', 'Offline'),
     )
 
+    INTERVIEW_RESULT = (
+        ('PENDING', 'Pending'),
+        ('SELECTED', 'Selected'),
+        ('REJECTED', 'Rejected'),
+        ('WAITLISTED', 'Waitlisted'),
+    )
+
     OFFER_STATUS = (
         ('PENDING', 'Pending'),
         ('ACCEPTED', 'Accepted'),
@@ -589,16 +596,34 @@ class JobApplication(models.Model):
 class InterviewSchedule(models.Model):
     """
     Tracks interview schedules for shortlisted students for a job posting.
+    Includes conflict detection via date/time_slot/end_time/venue and
+    reschedule tracking (max 2 reschedules enforced at the API layer).
     """
     job_posting = models.ForeignKey(JobPosting, on_delete=models.CASCADE, related_name='interviews')
     date = models.DateField()
     time_slot = models.TimeField()
+    duration_minutes = models.PositiveIntegerField(
+        default=60,
+        help_text="Duration of the interview slot in minutes"
+    )
+    end_time = models.TimeField(
+        null=True, blank=True,
+        help_text="Auto-computed from time_slot + duration_minutes"
+    )
     mode = models.CharField(max_length=10, choices=Constants.INTERVIEW_MODE, default='OFFLINE')
     venue_or_link = models.CharField(
         max_length=500, blank=True, null=True,
         help_text="Physical venue or online meeting link"
     )
     description = models.TextField(max_length=1000, blank=True, null=True)
+    round_number = models.PositiveIntegerField(
+        default=1,
+        help_text="Interview round number (1, 2, 3...)"
+    )
+    reschedule_count = models.PositiveIntegerField(
+        default=0,
+        help_text="Number of times this interview has been rescheduled (max 2)"
+    )
     created_by = models.ForeignKey(
         User, on_delete=models.SET_NULL, null=True, blank=True,
         related_name='created_interviews'
@@ -608,8 +633,18 @@ class InterviewSchedule(models.Model):
     class Meta:
         ordering = ['date', 'time_slot']
 
+    def save(self, *args, **kwargs):
+        """Auto-compute end_time from time_slot + duration_minutes."""
+        if self.time_slot and self.duration_minutes:
+            start_dt = datetime.datetime.combine(datetime.date.today(), self.time_slot)
+            end_dt = start_dt + datetime.timedelta(minutes=self.duration_minutes)
+            self.end_time = end_dt.time()
+        super().save(*args, **kwargs)
+
     def __str__(self):
-        return 'Interview for {} on {}'.format(self.job_posting.title, self.date)
+        return 'Interview for {} on {} (Round {})'.format(
+            self.job_posting.title, self.date, self.round_number
+        )
 
 
 class InterviewPanel(models.Model):
@@ -620,8 +655,10 @@ class InterviewPanel(models.Model):
     application = models.ForeignKey(JobApplication, on_delete=models.CASCADE, related_name='interview_panels')
     remarks = models.TextField(max_length=500, blank=True, null=True)
     result = models.CharField(
-        max_length=20, blank=True, null=True,
-        help_text="SELECTED / REJECTED / WAITLISTED"
+        max_length=20,
+        choices=Constants.INTERVIEW_RESULT,
+        default='PENDING',
+        help_text="PENDING / SELECTED / REJECTED / WAITLISTED"
     )
 
     class Meta:
