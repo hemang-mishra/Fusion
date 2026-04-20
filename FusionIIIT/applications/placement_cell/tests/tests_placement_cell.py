@@ -395,3 +395,54 @@ class PlacementCellServiceTests(TestCase):
 		self.assertEqual(summary['total'], 2)
 		self.assertEqual(summary['offer_extended'], 1)
 		self.assertEqual(summary['interview_scheduled'], 1)
+	def test_check_interview_conflicts_no_conflict(self):
+		from applications.placement_cell.services import check_interview_conflicts
+		from django.utils import timezone
+		from datetime import timedelta
+		
+		conflict = check_interview_conflicts(
+			interview_date=timezone.now().date(),
+			time_slot=timezone.now().time(),
+			end_time=(timezone.now() + timedelta(hours=1)).time(),
+			venue_or_link='LHC 101'
+		)
+		self.assertFalse(conflict)
+
+	def test_create_interview_schedule(self):
+		from applications.placement_cell.services import create_interview_schedule
+		from applications.placement_cell.models import InterviewSchedule
+		
+		# Use the active job created in setUp
+		schedule = create_interview_schedule(
+			job_posting=self.active_job,
+			date=timezone.now().date(),
+			time=timezone.now().time(),
+			location='LHC 101',
+			interview_type='TECHNICAL'
+		)
+		
+		self.assertIsNotNone(schedule.id)
+		self.assertEqual(schedule.job_posting, self.active_job)
+		self.assertEqual(schedule.location, 'LHC 101')
+		self.assertEqual(schedule.interview_type, 'TECHNICAL')
+
+	def test_check_interview_conflicts_has_conflict(self):
+		from applications.placement_cell.services import create_interview_schedule, check_interview_conflicts
+		
+		schedule = create_interview_schedule(
+			job_posting=self.active_job,
+			date=timezone.now().date(),
+			time=timezone.now().time(),
+			location='LHC 102',
+			interview_type='HR'
+		)
+		
+		conflict = check_interview_conflicts(
+			interview_date=schedule.date,
+			time_slot=schedule.time,
+			end_time=schedule.time, # simplified for mock
+			venue_or_link='LHC 102'
+		)
+		
+		# Assuming check_interview_conflicts checks venue and date
+		self.assertTrue(conflict)
