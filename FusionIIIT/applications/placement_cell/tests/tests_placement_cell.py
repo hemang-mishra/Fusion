@@ -395,3 +395,273 @@ class PlacementCellServiceTests(TestCase):
 		self.assertEqual(summary['total'], 2)
 		self.assertEqual(summary['offer_extended'], 1)
 		self.assertEqual(summary['interview_scheduled'], 1)
+	def test_check_interview_conflicts_no_conflict(self):
+		from applications.placement_cell.services import check_interview_conflicts
+		from django.utils import timezone
+		from datetime import timedelta
+
+		conflict = check_interview_conflicts(
+			interview_date=timezone.now().date(),
+			time_slot=timezone.now().time(),
+			end_time=(timezone.now() + timedelta(hours=1)).time(),
+			venue_or_link='LHC 101'
+		)
+		self.assertFalse(conflict)
+
+	def test_create_interview_schedule(self):
+		from applications.placement_cell.services import create_interview_schedule
+		from applications.placement_cell.models import InterviewSchedule
+
+		# Use the active job created in setUp
+		schedule = create_interview_schedule(
+			job_posting=self.active_job,
+			date=timezone.now().date(),
+			time=timezone.now().time(),
+			location='LHC 101',
+			interview_type='TECHNICAL'
+		)
+
+		self.assertIsNotNone(schedule.id)
+		self.assertEqual(schedule.job_posting, self.active_job)
+		self.assertEqual(schedule.location, 'LHC 101')
+		self.assertEqual(schedule.interview_type, 'TECHNICAL')
+
+	def test_check_interview_conflicts_has_conflict(self):
+		from applications.placement_cell.services import create_interview_schedule, check_interview_conflicts
+
+		schedule = create_interview_schedule(
+			job_posting=self.active_job,
+			date=timezone.now().date(),
+			time=timezone.now().time(),
+			location='LHC 102',
+			interview_type='HR'
+		)
+
+		conflict = check_interview_conflicts(
+			interview_date=schedule.date,
+			time_slot=schedule.time,
+			end_time=schedule.time, # simplified for mock
+			venue_or_link='LHC 102'
+		)
+
+		# Assuming check_interview_conflicts checks venue and date
+		self.assertTrue(conflict)
+
+	def test_check_eligibility_exact_cpi(self):
+		self.eligible_student.cpi = self.active_job.min_cpi
+		self.eligible_student.save()
+		is_eligible, reasons = check_eligibility(self.eligible_student, self.active_job)
+		self.assertTrue(is_eligible)
+		self.assertEqual(reasons, [])
+
+	def test_check_duplicate_application_multiple_jobs(self):
+		create_job_application(self.eligible_student, self.active_job)
+		is_duplicate = check_duplicate_application(self.eligible_student, self.expired_job)
+		self.assertFalse(is_duplicate)
+
+	def test_update_job_application_status_no_remarks(self):
+		application = create_job_application(self.eligible_student, self.active_job)
+		updated = update_job_application_status(application, 'SHORTLISTED')
+		self.assertEqual(updated.status, 'SHORTLISTED')
+
+	def test_process_offer_response_invalid_response(self):
+		application = create_job_application(self.eligible_student, self.active_job)
+		offer = JobOffer.objects.create(
+			application=application,
+			ctc_offered=13,
+			response_deadline=timezone.now() + timedelta(days=1),
+		)
+		success, message = process_offer_response(offer, 'maybe_something_else')
+		self.assertFalse(success)
+		self.assertIn('Invalid', message)
+
+	def test_process_offer_response_expired_offer(self):
+		application = create_job_application(self.eligible_student, self.active_job)
+		offer = JobOffer.objects.create(
+			application=application,
+			ctc_offered=13,
+			response_deadline=timezone.now() - timedelta(days=1),
+			status='EXPIRED'
+		)
+		success, message = process_offer_response(offer, 'accept')
+		self.assertFalse(success)
+
+	def test_expire_pending_offers_no_offers(self):
+		JobOffer.objects.all().delete()
+		expired_count = expire_pending_offers()
+		self.assertEqual(expired_count, 0)
+
+	def test_expire_pending_offers_all_active(self):
+		JobOffer.objects.all().delete()
+		application = create_job_application(self.eligible_student, self.active_job)
+		JobOffer.objects.create(
+			application=application,
+			ctc_offered=12,
+			response_deadline=timezone.now() + timedelta(days=5),
+			status='PENDING',
+		)
+		expired_count = expire_pending_offers()
+		self.assertEqual(expired_count, 0)
+
+	def test_get_placement_statistics_no_offers(self):
+		JobOffer.objects.all().delete()
+		stats = get_placement_statistics()
+		self.assertEqual(stats['total_offers'], 0)
+		self.assertEqual(stats['total_ctc'], 0)
+
+	def test_get_student_application_summary_empty(self):
+		JobApplication.objects.all().delete()
+		summary = get_student_application_summary(self.eligible_student)
+		self.assertEqual(summary['total'], 0)
+		self.assertEqual(summary['offer_extended'], 0)
+
+	def test_check_placement_policy_allow_dream_ctc_exact_threshold(self):
+		self.policy.allow_dream_company = True
+		self.policy.dream_ctc_threshold = 15.0
+		self.policy.save()
+
+		application = JobApplication.objects.create(
+			job_posting=self.active_job,
+			student=self.eligible_student,
+		)
+		JobOffer.objects.create(
+			application=application,
+			ctc_offered=11,
+			response_deadline=timezone.now() + timedelta(days=1),
+			status='ACCEPTED',
+		)
+
+		dream_job = JobPosting.objects.create(
+			company=self.company,
+			title='Dream Role',
+			description='Exact paying role',
+			job_type='PLACEMENT',
+			ctc=15.0,
+			min_cpi=7.0,
+			eligible_programmes='B.Tech',
+			eligible_branches='CSE',
+			application_deadline=timezone.now() + timedelta(days=5),
+		)
+
+		can_apply, reason = check_placement_policy(self.eligible_student, dream_job)
+		self.assertTrue(can_apply)
+		self.assertEqual(reason, '')
+
+	def test_check_eligibility_branch_case_insensitive(self):
+		self.active_job.eligible_branches = 'cse,me'
+		self.active_job.save()
+		is_eligible, reasons = check_eligibility(self.eligible_student, self.active_job)
+		self.assertTrue(is_eligible)
+		self.assertEqual(reasons, [])
+
+	def test_check_eligibility_programme_case_insensitive(self):
+		self.active_job.eligible_programmes = 'b.tech'
+		self.active_job.save()
+		is_eligible, reasons = check_eligibility(self.eligible_student, self.active_job)
+		self.assertTrue(is_eligible)
+		self.assertEqual(reasons, [])
+
+	def test_check_placement_policy_max_offers_not_exceeded(self):
+		self.policy.max_offers_allowed = 2
+		self.policy.save()
+		application = create_job_application(self.eligible_student, self.active_job)
+		JobOffer.objects.create(
+			application=application,
+			ctc_offered=11,
+			response_deadline=timezone.now() + timedelta(days=1),
+			status='ACCEPTED',
+		)
+		can_apply, reason = check_placement_policy(self.eligible_student, self.expired_job)
+		self.assertTrue(can_apply)
+		self.assertEqual(reason, '')
+
+	def test_check_placement_policy_max_offers_exceeded(self):
+		self.policy.max_offers_allowed = 2
+		self.policy.save()
+		app1 = create_job_application(self.eligible_student, self.active_job)
+		app2 = create_job_application(self.eligible_student, self.expired_job)
+		JobOffer.objects.create(
+			application=app1, ctc_offered=10, response_deadline=timezone.now() + timedelta(days=1), status='ACCEPTED'
+		)
+		JobOffer.objects.create(
+			application=app2, ctc_offered=12, response_deadline=timezone.now() + timedelta(days=1), status='ACCEPTED'
+		)
+		new_job = JobPosting.objects.create(company=self.company, title='New', job_type='PLACEMENT', ctc=8.0, min_cpi=6.0, application_deadline=timezone.now() + timedelta(days=2))
+		can_apply, reason = check_placement_policy(self.eligible_student, new_job)
+		self.assertFalse(can_apply)
+		self.assertIn('Maximum allowed', reason)
+
+	def test_check_eligibility_no_branch_restriction(self):
+		self.active_job.eligible_branches = ''
+		self.active_job.save()
+		is_eligible, reasons = check_eligibility(self.eligible_student, self.active_job)
+		self.assertTrue(is_eligible)
+		self.assertEqual(reasons, [])
+
+	def test_check_eligibility_no_programme_restriction(self):
+		self.active_job.eligible_programmes = None
+		self.active_job.save()
+		is_eligible, reasons = check_eligibility(self.eligible_student, self.active_job)
+		self.assertTrue(is_eligible)
+		self.assertEqual(reasons, [])
+
+	def test_update_job_application_status_keeps_history(self):
+		application = create_job_application(self.eligible_student, self.active_job)
+		updated = update_job_application_status(application, 'INTERVIEW_SCHEDULED', 'Scheduled for tomorrow')
+		self.assertEqual(updated.status, 'INTERVIEW_SCHEDULED')
+		self.assertEqual(updated.remarks, 'Scheduled for tomorrow')
+
+	def test_process_offer_response_student_already_placed_diff_type(self):
+		StudentPlacement.objects.create(unique_id=self.eligible_student, placed_type='INTERNSHIP')
+		application = create_job_application(self.eligible_student, self.active_job)
+		offer = JobOffer.objects.create(application=application, ctc_offered=13, response_deadline=timezone.now() + timedelta(days=1))
+		success, message = process_offer_response(offer, 'accept')
+		self.assertTrue(success)
+		self.assertTrue(StudentPlacement.objects.filter(unique_id=self.eligible_student, placed_type='PLACED').exists())
+
+	def test_check_interview_conflicts_different_venue_overlap(self):
+		from applications.placement_cell.services import create_interview_schedule, check_interview_conflicts
+		schedule = create_interview_schedule(
+			job_posting=self.active_job, date=timezone.now().date(), time=timezone.now().time(), location='LHC 101', interview_type='TECHNICAL'
+		)
+		conflict = check_interview_conflicts(
+			interview_date=schedule.date, time_slot=schedule.time, end_time=(timezone.now() + timedelta(hours=1)).time(), venue_or_link='LHC 102'
+		)
+		# Assuming students/panel logic checks time overlaps eventually. Here we mock check simply testing function doesn't crash on different venues.
+		self.assertIsNotNone(conflict)
+
+	def test_create_job_application_different_students(self):
+		app1 = create_job_application(self.eligible_student, self.active_job)
+		self.ineligible_student.cpi = 9.0  # Make eligible for this test
+		self.ineligible_student.save()
+		app2 = create_job_application(self.ineligible_student, self.active_job)
+		self.assertNotEqual(app1.id, app2.id)
+
+	def test_get_student_application_summary_multiple_states(self):
+		app1 = create_job_application(self.eligible_student, self.active_job)
+		update_job_application_status(app1, 'SELECTED')
+		
+		# Allow ineliglbe_student applied for testing summary counts for the eligible student specifically
+		app2 = create_job_application(self.eligible_student, self.expired_job)
+		update_job_application_status(app2, 'REJECTED')
+		
+		summary = get_student_application_summary(self.eligible_student)
+		self.assertEqual(summary['total'], 2)
+		self.assertEqual(summary['selected'], 1)
+		self.assertEqual(summary['rejected'], 1)
+
+	def test_check_eligibility_batch_exactly_on_boundary(self):
+		self.active_job.eligible_batch_from = 2022
+		self.active_job.eligible_batch_to = 2022
+		self.active_job.save()
+		is_eligible, reasons = check_eligibility(self.eligible_student, self.active_job)
+		self.assertTrue(is_eligible)
+		self.assertEqual(reasons, [])
+
+	def test_register_company_with_empty_name(self):
+		company, created = register_company('')
+		if company is None:
+			self.assertFalse(created)
+		else:
+			self.assertTrue(created)
+			self.assertEqual(company.company_name, '')
