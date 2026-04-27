@@ -11,6 +11,8 @@ from applications.placement_cell.models import (
     InterviewPanel, JobOffer, Announcement, PlacementPolicy,
     Appeal, PlacementProfile, PlacementProfileAuditLog,
     AlumniProfile, MentorshipProfile, MentorshipSession, JobReferral,
+    JobRole, JobFormField, JobFormFieldOption,
+    StudentResume, JobApplicationResponse, PlacementClaim,
 )
 
 
@@ -303,27 +305,148 @@ class CompanyListSerializer(serializers.ModelSerializer):
         fields = ('id', 'name', 'domain', 'website', 'approval_status')
 
 
+# ---- Dynamic Job Form Serializers ----
+
+class JobFormFieldOptionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = JobFormFieldOption
+        fields = ('id', 'label', 'value', 'order')
+
+
+class JobFormFieldSerializer(serializers.ModelSerializer):
+    options = JobFormFieldOptionSerializer(many=True, required=False)
+
+    class Meta:
+        model = JobFormField
+        fields = (
+            'id', 'job_posting', 'job_role', 'label', 'help_text',
+            'field_type', 'is_required', 'order',
+            'min_value', 'max_value', 'max_length',
+            'options',
+        )
+        read_only_fields = ('job_posting', 'job_role')
+
+
+class JobRoleSerializer(serializers.ModelSerializer):
+    form_fields = JobFormFieldSerializer(many=True, required=False)
+
+    class Meta:
+        model = JobRole
+        fields = (
+            'id', 'job_posting', 'title', 'description', 'seats',
+            'ctc', 'compensation_type', 'internship_duration_months',
+            'order', 'created_at', 'form_fields',
+        )
+        read_only_fields = ('job_posting', 'created_at')
+
+
+class StudentResumeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = StudentResume
+        fields = ('id', 'student', 'name', 'url', 'is_default',
+                  'created_at', 'updated_at')
+        read_only_fields = ('student', 'created_at', 'updated_at')
+
+
+class JobApplicationResponseSerializer(serializers.ModelSerializer):
+    field_label = serializers.CharField(source='field.label', read_only=True)
+    field_type = serializers.CharField(source='field.field_type', read_only=True)
+
+    class Meta:
+        model = JobApplicationResponse
+        fields = ('id', 'application', 'field', 'field_label',
+                  'field_type', 'value', 'created_at')
+        read_only_fields = ('application', 'created_at')
+
+
 class JobPostingSerializer(serializers.ModelSerializer):
     company_name = serializers.CharField(source='company.name', read_only=True)
     total_applications = serializers.IntegerField(read_only=True)
     is_deadline_passed = serializers.BooleanField(read_only=True)
     required_skills = SkillSerializer(many=True, read_only=True)
+    roles = JobRoleSerializer(many=True, required=False)
+    form_fields = JobFormFieldSerializer(many=True, required=False)
 
     class Meta:
         model = JobPosting
         fields = '__all__'
         read_only_fields = ('posted_by', 'created_at', 'updated_at')
 
+    # ---- Nested write helpers ----
+
+    @staticmethod
+    def _create_field(field_data, *, posting=None, role=None):
+        options = field_data.pop('options', [])
+        # Strip read-only fk fields if present
+        field_data.pop('job_posting', None)
+        field_data.pop('job_role', None)
+        field = JobFormField.objects.create(
+            job_posting=posting, job_role=role, **field_data
+        )
+        for idx, opt in enumerate(options):
+            JobFormFieldOption.objects.create(
+                field=field,
+                label=opt.get('label', ''),
+                value=opt.get('value'),
+                order=opt.get('order', idx),
+            )
+        return field
+
+    def _apply_nested(self, posting, roles_data, fields_data):
+        # Posting-level shared fields
+        for idx, fdata in enumerate(fields_data):
+            fdata.setdefault('order', idx)
+            self._create_field(fdata, posting=posting)
+        # Roles + role-specific fields
+        for r_idx, rdata in enumerate(roles_data):
+            role_fields = rdata.pop('form_fields', [])
+            rdata.pop('job_posting', None)
+            rdata.setdefault('order', r_idx)
+            role = JobRole.objects.create(job_posting=posting, **rdata)
+            for f_idx, fdata in enumerate(role_fields):
+                fdata.setdefault('order', f_idx)
+                self._create_field(fdata, role=role)
+
+    def create(self, validated_data):
+        roles_data = validated_data.pop('roles', [])
+        fields_data = validated_data.pop('form_fields', [])
+        posting = super().create(validated_data)
+        self._apply_nested(posting, roles_data, fields_data)
+        return posting
+
+    def update(self, instance, validated_data):
+        roles_data = validated_data.pop('roles', None)
+        fields_data = validated_data.pop('form_fields', None)
+        posting = super().update(instance, validated_data)
+        # Replace nested structure when explicitly provided
+        if roles_data is not None or fields_data is not None:
+            if fields_data is not None:
+                posting.form_fields.all().delete()
+            if roles_data is not None:
+                posting.roles.all().delete()
+            self._apply_nested(
+                posting,
+                roles_data if roles_data is not None else [],
+                fields_data if fields_data is not None else [],
+            )
+        return posting
+
 
 class JobPostingListSerializer(serializers.ModelSerializer):
     """Lightweight serializer for job listing pages."""
     company_name = serializers.CharField(source='company.name', read_only=True)
     total_applications = serializers.IntegerField(read_only=True)
+    role_titles = serializers.SerializerMethodField()
 
     class Meta:
         model = JobPosting
         fields = ('id', 'title', 'company', 'company_name', 'job_type', 'ctc',
-                  'location', 'application_deadline', 'is_active', 'total_applications')
+                  'compensation_type', 'internship_duration_months', 'jd_link',
+                  'location', 'application_deadline', 'is_active',
+                  'total_applications', 'role_titles')
+
+    def get_role_titles(self, obj):
+        return [r.title for r in obj.roles.all()]
 
 
 class JobApplicationSerializer(serializers.ModelSerializer):
@@ -331,6 +454,35 @@ class JobApplicationSerializer(serializers.ModelSerializer):
     student_roll = serializers.CharField(source='student.id.id', read_only=True)
     job_title = serializers.CharField(source='job_posting.title', read_only=True)
     company_name = serializers.CharField(source='job_posting.company.name', read_only=True)
+    role_title = serializers.CharField(source='job_role.title', read_only=True)
+    responses = JobApplicationResponseSerializer(many=True, read_only=True)
+
+    # Compensation context for the listing UI ----------------------------------
+    posting_ctc = serializers.DecimalField(
+        source='job_posting.ctc', max_digits=10, decimal_places=2, read_only=True
+    )
+    posting_compensation_type = serializers.CharField(
+        source='job_posting.compensation_type', read_only=True
+    )
+    posting_job_type = serializers.CharField(
+        source='job_posting.job_type', read_only=True
+    )
+    posting_internship_duration_months = serializers.IntegerField(
+        source='job_posting.internship_duration_months', read_only=True
+    )
+    posting_jd_link = serializers.URLField(
+        source='job_posting.jd_link', read_only=True
+    )
+    role_ctc = serializers.DecimalField(
+        source='job_role.ctc', max_digits=10, decimal_places=2, read_only=True
+    )
+    role_compensation_type = serializers.CharField(
+        source='job_role.compensation_type', read_only=True
+    )
+    # Offer details (only present once an offer has been extended)
+    offer_ctc = serializers.SerializerMethodField()
+    offer_status = serializers.SerializerMethodField()
+    offer_designation = serializers.SerializerMethodField()
 
     class Meta:
         model = JobApplication
@@ -340,6 +492,21 @@ class JobApplicationSerializer(serializers.ModelSerializer):
     def get_student_name(self, obj):
         user = obj.student.id.user
         return '{} {}'.format(user.first_name, user.last_name)
+
+    def _offer(self, obj):
+        return getattr(obj, 'offer', None)
+
+    def get_offer_ctc(self, obj):
+        offer = self._offer(obj)
+        return str(offer.ctc_offered) if offer else None
+
+    def get_offer_status(self, obj):
+        offer = self._offer(obj)
+        return offer.status if offer else None
+
+    def get_offer_designation(self, obj):
+        offer = self._offer(obj)
+        return offer.designation_offered if offer else None
 
 
 class InterviewScheduleSerializer(serializers.ModelSerializer):
@@ -380,6 +547,16 @@ class JobOfferSerializer(serializers.ModelSerializer):
     job_title = serializers.CharField(
         source='application.job_posting.title', read_only=True
     )
+    posting_compensation_type = serializers.CharField(
+        source='application.job_posting.compensation_type', read_only=True
+    )
+    posting_job_type = serializers.CharField(
+        source='application.job_posting.job_type', read_only=True
+    )
+    posting_internship_duration_months = serializers.IntegerField(
+        source='application.job_posting.internship_duration_months',
+        read_only=True
+    )
     is_deadline_passed = serializers.BooleanField(read_only=True)
     response_deadline = serializers.DateTimeField(required=False)
 
@@ -405,6 +582,35 @@ class AnnouncementSerializer(serializers.ModelSerializer):
         if obj.created_by:
             return '{} {}'.format(obj.created_by.first_name, obj.created_by.last_name)
         return ''
+
+    def validate(self, attrs):
+        publish_at = attrs.get('publish_at')
+        expires_at = attrs.get('expires_at')
+        visibility_scope = attrs.get('visibility_scope')
+        visibility_targets = attrs.get('visibility_targets')
+
+        if self.instance:
+            publish_at = publish_at or self.instance.publish_at
+            expires_at = expires_at if 'expires_at' in attrs else self.instance.expires_at
+            visibility_scope = visibility_scope or self.instance.visibility_scope
+            visibility_targets = (
+                visibility_targets if 'visibility_targets' in attrs else self.instance.visibility_targets
+            )
+
+        if publish_at and expires_at and expires_at <= publish_at:
+            raise serializers.ValidationError(
+                {'expires_at': 'Expiry must be after publish time.'}
+            )
+
+        if visibility_scope == 'SPECIFIC_BATCH' and not visibility_targets:
+            raise serializers.ValidationError(
+                {'visibility_targets': 'Provide visibility targets for specific batch visibility.'}
+            )
+
+        if visibility_scope == 'ALL':
+            attrs['visibility_targets'] = ''
+
+        return attrs
 
 
 class PlacementPolicySerializer(serializers.ModelSerializer):
@@ -465,15 +671,79 @@ class PlacementProfileSerializer(serializers.ModelSerializer):
     username = serializers.CharField(source='student.id.user.username', read_only=True)
     first_name = serializers.CharField(source='student.id.user.first_name', read_only=True)
     last_name = serializers.CharField(source='student.id.user.last_name', read_only=True)
+    is_complete = serializers.BooleanField(read_only=True)
+    missing_required_fields = serializers.SerializerMethodField()
 
     class Meta:
         model = PlacementProfile
         fields = [
-            'id', 'student', 'username', 'first_name', 'last_name', 'resume', 'about_me', 'linkedin_url',
-            'github_url', 'portfolio_url', 'achievements', 'certifications',
-            'audit_logs'
+            'id', 'student', 'username', 'first_name', 'last_name', 'resume',
+            'about_me', 'linkedin_url', 'github_url', 'portfolio_url',
+            'professional_email', 'achievements', 'certifications',
+            'apply_override', 'apply_override_remarks',
+            'is_complete', 'missing_required_fields', 'audit_logs',
         ]
-        read_only_fields = ['student', 'username', 'first_name', 'last_name']
+        # Students cannot toggle their own override; only TPO can flip it
+        # via the Placement Status admin tab.
+        read_only_fields = [
+            'student', 'username', 'first_name', 'last_name',
+            'apply_override', 'apply_override_remarks',
+        ]
+
+    def get_missing_required_fields(self, obj):
+        return obj.missing_required_fields()
+
+
+class PlacementClaimSerializer(serializers.ModelSerializer):
+    student_name = serializers.SerializerMethodField()
+    student_roll = serializers.CharField(source='student.id.id', read_only=True)
+    verified_by_name = serializers.SerializerMethodField()
+    created_by_name = serializers.SerializerMethodField()
+    # The viewset always sets `student` server-side: for student-submitted
+    # claims it's auto-derived from the request user, for TPO-created claims
+    # it's validated explicitly in ``perform_create``. Making it optional here
+    # keeps the student-facing form free of an unused "student" field.
+    student = serializers.PrimaryKeyRelatedField(
+        queryset=PlacementClaim._meta.get_field('student').related_model.objects.all(),
+        required=False,
+    )
+
+    class Meta:
+        model = PlacementClaim
+        fields = [
+            'id', 'student', 'student_name', 'student_roll',
+            'kind', 'company_name', 'role_title', 'location',
+            'compensation_amount', 'duration_months',
+            'start_date', 'end_date', 'source', 'proof_link', 'notes',
+            'status', 'verification_remarks', 'verified_at',
+            'related_offer',
+            'created_by', 'created_by_name',
+            'verified_by', 'verified_by_name',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = (
+            'created_by', 'created_by_name',
+            'verified_by', 'verified_by_name',
+            'verified_at', 'created_at', 'updated_at', 'related_offer',
+        )
+
+    def _user_name(self, user):
+        if not user:
+            return None
+        full = '{} {}'.format(user.first_name or '', user.last_name or '').strip()
+        return full or user.username
+
+    def get_student_name(self, obj):
+        try:
+            return self._user_name(obj.student.id.user)
+        except Exception:  # pragma: no cover
+            return None
+
+    def get_verified_by_name(self, obj):
+        return self._user_name(obj.verified_by)
+
+    def get_created_by_name(self, obj):
+        return self._user_name(obj.created_by)
 
     def validate_resume(self, value):
         from django.core.exceptions import ValidationError

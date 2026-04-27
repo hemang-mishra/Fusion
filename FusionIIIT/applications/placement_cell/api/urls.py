@@ -12,14 +12,20 @@ router.register(r'job-offers', api_views.JobOfferViewSet, basename='joboffer')
 router.register(r'announcements', api_views.AnnouncementViewSet, basename='announcement')
 router.register(r'appeals', api_views.AppealViewSet, basename='appeal')
 router.register(r'placement-profile', api_views.PlacementProfileViewSet, basename='placementprofile')
+router.register(r'placement-claims', api_views.PlacementClaimViewSet, basename='placementclaim')
 router.register(r'alumni', api_views.AlumniProfileViewSet, basename='alumni')
 router.register(r'mentorship', api_views.MentorshipProfileViewSet, basename='mentorship')
 router.register(r'mentorship-sessions', api_views.MentorshipSessionViewSet, basename='mentorshipsession')
 router.register(r'job-referrals', api_views.JobReferralViewSet, basename='jobreferral')
+router.register(r'student-resumes', api_views.StudentResumeViewSet, basename='studentresume')
 
 urlpatterns = [
     # 1. Role & Auth
     url(r'^roles/$', api_views.user_roles_api, name='user_roles_api'),
+
+    # 1b. Eligibility options (programmes / branches / batches)
+    url(r'^eligibility-options/$', api_views.eligibility_options_api,
+        name='eligibility_options_api'),
 
     # 2. Placement Schedule (Legacy)
     url(r'^placement/$', api_views.placement_schedule_api, name='placement_schedule_api'),

@@ -18,15 +18,16 @@ from io import BytesIO
 
 from django.contrib.auth.models import User
 from django.core.paginator import Paginator
-from django.db.models import Avg, Count, Max, Min, Q, Sum
+from django.db.models import Avg, Case, Count, IntegerField, Max, Min, Q, Sum, Value, When
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 
-from rest_framework import status, viewsets
+from rest_framework import status, viewsets, serializers
 from rest_framework.decorators import action, api_view, permission_classes, authentication_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.authentication import TokenAuthentication
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 
 from applications.globals.models import ExtraInfo, HoldsDesignation
@@ -41,6 +42,8 @@ from applications.placement_cell.models import (
     InterviewPanel, JobOffer, Announcement, PlacementPolicy,
     Coauthor, Coinventor, Appeal, PlacementProfile, PlacementProfileAuditLog,
     AlumniProfile, MentorshipProfile, MentorshipSession, JobReferral,
+    JobRole, JobFormField, JobFormFieldOption,
+    StudentResume, JobApplicationResponse, PlacementClaim,
 )
 
 from applications.placement_cell.api.serializers import (
@@ -54,15 +57,18 @@ from applications.placement_cell.api.serializers import (
     StudentPlacementSerializer, ChairmanVisitSerializer,
     CompanySerializer, CompanyListSerializer,
     JobPostingSerializer, JobPostingListSerializer,
-    JobApplicationSerializer,
+    JobApplicationSerializer, JobFormFieldSerializer,
+    JobRoleSerializer,
     InterviewScheduleSerializer, InterviewPanelSerializer,
     JobOfferSerializer,
     AnnouncementSerializer,
     PlacementPolicySerializer, PlacementProfileSerializer,
+    PlacementClaimSerializer,
     AppealSerializer,
     AlumniProfileSerializer, AlumniProfileListSerializer,
     MentorshipProfileSerializer, MentorshipSessionSerializer,
     JobReferralSerializer,
+    StudentResumeSerializer, JobApplicationResponseSerializer,
 )
 
 # Import business logic services
@@ -75,7 +81,8 @@ from applications.placement_cell.services import (
     get_placement_records, get_placement_year_statistics, get_student_records,
     get_debarred_students, debar_student, undebar_student, get_student_debar_status,
     register_company, get_all_companies, check_eligibility, check_duplicate_application,
-    check_placement_policy, create_job_application, update_job_application_status,
+    check_placement_policy, has_verified_placement,
+    create_job_application, update_job_application_status,
     process_offer_response, expire_pending_offers, get_placement_statistics,
     get_student_application_summary, get_placement_report_data, get_interview_schedules,
     create_interview_schedule, get_interview_details, get_placement_policies,
@@ -83,6 +90,16 @@ from applications.placement_cell.services import (
     get_form_field_config, get_active_announcements,
     approve_alumni, reject_alumni,
     check_interview_conflicts, validate_reschedule,
+)
+
+# Notification helpers (best-effort, never raise to caller)
+from applications.placement_cell.notifications_utils import (
+    notify_new_job_posting,
+    notify_new_application,
+    notify_application_status_change,
+    notify_offer_extended,
+    notify_offer_accepted,
+    notify_announcement,
 )
 
 
@@ -133,6 +150,82 @@ def _check_invitation_date(placementstatus_qs):
 def user_roles_api(request):
     """Return the user's placement roles."""
     return Response(get_user_roles(request.user))
+
+
+# =============================================
+# 1b. ELIGIBILITY OPTIONS (programmes / branches / batches)
+# =============================================
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+@authentication_classes([TokenAuthentication])
+def eligibility_options_api(request):
+    """
+    Return the lists of programmes, branches/disciplines, and batch years
+    that the placement officer can choose from when creating a job posting.
+
+    Sources of truth (in order of preference):
+      - Programmes:  ``academic_information.Constants.PROGRAMME``
+      - Branches:    union of ``programme_curriculum.Discipline``
+                     acronyms/names and ``globals.DepartmentInfo`` names
+      - Batches:     distinct batch years present in
+                     ``academic_information.Student`` (running batches),
+                     enriched with running batches from
+                     ``programme_curriculum.Batch``.
+    """
+    # ---- Programmes ----
+    try:
+        from applications.academic_information.models import Constants as AcadConstants
+        programmes = [p[0] for p in AcadConstants.PROGRAMME]
+    except Exception:
+        programmes = ['B.Tech', 'M.Tech', 'B.Des', 'M.Des', 'PhD']
+
+    # ---- Branches ----
+    branches = set()
+    try:
+        from applications.programme_curriculum.models import Discipline
+        for d in Discipline.objects.all():
+            if d.acronym:
+                branches.add(d.acronym.upper())
+            if d.name:
+                branches.add(d.name.upper())
+    except Exception:
+        pass
+    try:
+        from applications.globals.models import DepartmentInfo
+        for dept in DepartmentInfo.objects.all():
+            if dept.name:
+                branches.add(dept.name.upper())
+    except Exception:
+        pass
+    # Always include the canonical short codes used by Student.id.department.
+    branches.update({'CSE', 'ECE', 'ME', 'SM', 'DESIGN'})
+    branches_list = sorted(branches)
+
+    # ---- Batches ----
+    batch_years = set()
+    try:
+        for year in Student.objects.values_list('batch', flat=True).distinct():
+            if year:
+                batch_years.add(int(year))
+    except Exception:
+        pass
+    try:
+        from applications.programme_curriculum.models import Batch as PCBatch
+        for year in PCBatch.objects.filter(running_batch=True).values_list(
+            'year', flat=True
+        ).distinct():
+            if year:
+                batch_years.add(int(year))
+    except Exception:
+        pass
+    batches_list = sorted(batch_years, reverse=True)
+
+    return Response({
+        'programmes': programmes,
+        'branches': branches_list,
+        'batches': batches_list,
+    })
 
 
 # =============================================
@@ -237,9 +330,32 @@ def placement_schedule_detail_api(request, schedule_id):
 @permission_classes([IsAuthenticated])
 @authentication_classes([TokenAuthentication])
 def student_records_api(request):
-    """List all students with profile/placement info."""
-    data = get_all_students_with_placement_info()
-    return Response(data)
+    """
+    List students with profile / placement info.
+
+    Supports server-side search and pagination so the response stays small
+    even as the institute roster grows. Query params (all optional):
+
+      - ``q``           : substring match on name / roll / username
+      - ``department``  : exact department name to filter by
+      - ``page``        : 1-based page number (default 1)
+      - ``page_size``   : items per page (default 25, max 200)
+      - ``departments`` : if "1", a list of distinct department names is
+                          returned alongside the page (used to populate the
+                          frontend filter dropdown without an extra round trip)
+    """
+    payload = get_all_students_with_placement_info(
+        q=request.query_params.get('q'),
+        department=request.query_params.get('department') or None,
+        page=request.query_params.get('page', 1),
+        page_size=request.query_params.get('page_size', 25),
+    )
+    if request.query_params.get('departments') == '1':
+        from applications.placement_cell.services import (
+            get_student_record_departments,
+        )
+        payload['departments'] = get_student_record_departments()
+    return Response(payload)
 
 
 @api_view(['GET'])
@@ -841,7 +957,8 @@ def visits_api(request):
         return Response(ChairmanVisitSerializer(visits, many=True).data)
 
     elif request.method == 'POST':
-        if not is_chairman(request.user):
+        # Both placement chairman and placement officer can record visits.
+        if not is_tpo_or_chairman(request.user):
             return Response({'error': 'Not authorized'}, status=status.HTTP_403_FORBIDDEN)
 
         serializer = ChairmanVisitSerializer(data=request.data)
@@ -896,6 +1013,78 @@ class CompanyViewSet(viewsets.ModelViewSet):
         return Response({'status': 'rejected'})
 
 
+# =============================================
+# Dynamic Job Form helpers
+# =============================================
+
+def _is_blank(value):
+    if value is None:
+        return True
+    if isinstance(value, str) and value.strip() == '':
+        return True
+    if isinstance(value, list) and len(value) == 0:
+        return True
+    return False
+
+
+def _validate_form_responses(fields, responses_by_field):
+    """
+    Validate a list of JobFormField definitions against a dict of
+    field_id -> answer value. Returns (ok, error_message).
+    """
+    for field in fields:
+        value = responses_by_field.get(field.id)
+        provided = not _is_blank(value)
+
+        if field.is_required and not provided:
+            return False, "Field '{}' is required.".format(field.label)
+
+        if not provided:
+            continue
+
+        ftype = field.field_type
+        if ftype in ('SHORT_ANSWER', 'LONG_ANSWER'):
+            if not isinstance(value, str):
+                return False, "Field '{}' must be text.".format(field.label)
+            if field.max_length and len(value) > field.max_length:
+                return False, "Field '{}' exceeds max length of {}.".format(
+                    field.label, field.max_length
+                )
+        elif ftype == 'NUMBER':
+            try:
+                num = float(value)
+            except (TypeError, ValueError):
+                return False, "Field '{}' must be a number.".format(field.label)
+            if field.min_value is not None and num < field.min_value:
+                return False, "Field '{}' must be ≥ {}.".format(
+                    field.label, field.min_value
+                )
+            if field.max_value is not None and num > field.max_value:
+                return False, "Field '{}' must be ≤ {}.".format(
+                    field.label, field.max_value
+                )
+        elif ftype == 'SINGLE_CHOICE':
+            allowed = set(
+                o.value or o.label for o in field.options.all()
+            )
+            if str(value) not in allowed:
+                return False, "Field '{}' has an invalid choice.".format(
+                    field.label
+                )
+        elif ftype == 'MULTI_CHOICE':
+            if not isinstance(value, list):
+                return False, "Field '{}' must be a list.".format(field.label)
+            allowed = set(
+                o.value or o.label for o in field.options.all()
+            )
+            for v in value:
+                if str(v) not in allowed:
+                    return False, "Field '{}' has an invalid choice.".format(
+                        field.label
+                    )
+    return True, ''
+
+
 class JobPostingViewSet(viewsets.ModelViewSet):
     """API endpoint for Job Posting CRUD."""
     permission_classes = [IsAuthenticated]
@@ -903,9 +1092,32 @@ class JobPostingViewSet(viewsets.ModelViewSet):
     queryset = JobPosting.objects.all()
 
     def get_queryset(self):
+        base = JobPosting.objects.select_related('company').prefetch_related(
+            'roles', 'form_fields', 'form_fields__options',
+            'roles__form_fields', 'roles__form_fields__options',
+        )
         if is_tpo_or_chairman(self.request.user):
-            return JobPosting.objects.select_related('company').all()
-        return JobPosting.objects.select_related('company').filter(is_active=True)
+            return base.all()
+        # Students only see active, non-expired postings they are eligible
+        # for (programme + branch + batch). Eligibility is filtered at the
+        # Python level since `eligible_programmes`/`eligible_branches` are
+        # comma-separated text fields and `eligible_batches` is a JSON list.
+        active = base.filter(
+            is_active=True,
+            application_deadline__gt=timezone.now(),
+        )
+        student = _get_student(self.request.user)
+        if student is None:
+            # If the requesting user has no student profile, just return the
+            # active postings (no further filtering possible).
+            return active
+        from applications.placement_cell.notifications_utils import (
+            _is_student_eligible_for_posting,
+        )
+        eligible_ids = [
+            p.id for p in active if _is_student_eligible_for_posting(student, p)
+        ]
+        return base.filter(id__in=eligible_ids)
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -915,7 +1127,38 @@ class JobPostingViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         if not is_tpo_or_chairman(self.request.user):
             raise PermissionError("Not authorized")
-        serializer.save(posted_by=self.request.user)
+        posting = serializer.save(posted_by=self.request.user)
+        # Notify all eligible students about the new opportunity.
+        notify_new_job_posting(self.request.user, posting)
+
+    @action(detail=True, methods=['get'])
+    def form_schema(self, request, pk=None):
+        """
+        Return the dynamic form schema for a posting.
+        Includes shared posting-level fields and role-specific fields per role.
+        """
+        posting = self.get_object()
+        shared_fields = JobFormFieldSerializer(
+            posting.form_fields.all().prefetch_related('options'), many=True
+        ).data
+        roles = []
+        for role in posting.roles.all().prefetch_related('form_fields__options'):
+            roles.append({
+                'id': role.id,
+                'title': role.title,
+                'description': role.description,
+                'seats': role.seats,
+                'ctc': role.ctc,
+                'order': role.order,
+                'form_fields': JobFormFieldSerializer(
+                    role.form_fields.all(), many=True
+                ).data,
+            })
+        return Response({
+            'posting_id': posting.id,
+            'shared_fields': shared_fields,
+            'roles': roles,
+        })
 
     @action(detail=True, methods=['get'])
     def check_eligibility(self, request, pk=None):
@@ -931,23 +1174,95 @@ class JobPostingViewSet(viewsets.ModelViewSet):
         can_apply, policy_reason = check_placement_policy(student, posting)
         has_applied = check_duplicate_application(student, posting)
 
+        # Profile completeness lets the UI show a helpful prompt up front.
+        placement_profile = PlacementProfile.objects.filter(student=student).first()
+        if placement_profile:
+            missing_profile_fields = placement_profile.missing_required_fields()
+            profile_complete = placement_profile.is_complete
+            apply_override = placement_profile.apply_override
+        else:
+            missing_profile_fields = ['professional_email', 'linkedin_url', 'github_url']
+            profile_complete = False
+            apply_override = False
+
+        # Whether this student already has a verified placement/internship
+        # of the kind matching this posting.
+        kind = (
+            PlacementClaim.KIND_INTERNSHIP
+            if posting.job_type == 'INTERNSHIP'
+            else PlacementClaim.KIND_PLACEMENT
+        )
+        already_placed = has_verified_placement(student, kind)
+
         return Response({
             'eligible': is_eligible,
             'reasons': reasons,
             'policy_check': can_apply,
             'policy_reason': policy_reason,
             'already_applied': has_applied,
+            'profile_complete': profile_complete,
+            'missing_profile_fields': missing_profile_fields,
+            'already_placed': already_placed,
+            'apply_override': apply_override,
         })
 
     @action(detail=True, methods=['post'])
     def apply(self, request, pk=None):
-        """Student applies for a job."""
+        """
+        Student applies for a job.
+
+        Request body:
+            {
+              "job_role": <int|null>,             # selected role id (if posting has roles)
+              "selected_resume": <int|null>,      # StudentResume id (preferred)
+              "resume_url": "<str>",              # external URL fallback
+              "responses": [
+                  {"field": <field_id>, "value": <answer>},
+                  ...
+              ]
+            }
+        Validation: required fields must have non-empty values; numeric/choice
+        types are validated against their definition.
+        """
         posting = self.get_object()
         profile = get_object_or_404(ExtraInfo, user=request.user)
         try:
             student = Student.objects.get(id=profile)
         except Student.DoesNotExist:
             return Response({'error': 'Student profile not found'}, status=404)
+
+        # Block apply on expired/inactive postings
+        if not posting.is_active or posting.is_deadline_passed:
+            return Response(
+                {'error': 'This job posting is no longer accepting applications.'},
+                status=400,
+            )
+
+        # Require a complete PlacementProfile (professional email + LinkedIn +
+        # GitHub) before allowing an application.
+        placement_profile = PlacementProfile.objects.filter(student=student).first()
+        missing = (
+            placement_profile.missing_required_fields()
+            if placement_profile else
+            ['professional_email', 'linkedin_url', 'github_url']
+        )
+        if missing:
+            label_map = {
+                'professional_email': 'Professional email',
+                'linkedin_url': 'LinkedIn URL',
+                'github_url': 'GitHub URL',
+            }
+            pretty = ', '.join(label_map.get(m, m) for m in missing)
+            return Response(
+                {
+                    'error': (
+                        'Please complete your placement profile before applying. '
+                        'Missing: ' + pretty + '.'
+                    ),
+                    'missing_profile_fields': missing,
+                },
+                status=400,
+            )
 
         if check_duplicate_application(student, posting):
             return Response({'error': 'Already applied'}, status=400)
@@ -960,7 +1275,86 @@ class JobPostingViewSet(viewsets.ModelViewSet):
         if not can_apply:
             return Response({'error': policy_reason}, status=400)
 
+        # ---- Resolve job role (if posting has roles, role must be selected) ----
+        role = None
+        role_id = request.data.get('job_role')
+        if posting.roles.exists():
+            if not role_id:
+                return Response(
+                    {'error': 'Please select a job role.'}, status=400
+                )
+            try:
+                role = posting.roles.get(id=role_id)
+            except JobRole.DoesNotExist:
+                return Response({'error': 'Invalid job role.'}, status=400)
+
+        # ---- Resolve resume (link from profile or freeform URL) ----
+        selected_resume = None
+        resume_url = (request.data.get('resume_url') or '').strip()
+        sel_id = request.data.get('selected_resume')
+        if sel_id:
+            try:
+                selected_resume = StudentResume.objects.get(
+                    id=sel_id, student=student
+                )
+                resume_url = selected_resume.url
+            except StudentResume.DoesNotExist:
+                return Response(
+                    {'error': 'Selected resume not found in your profile.'},
+                    status=400,
+                )
+        if not resume_url:
+            return Response(
+                {'error': 'Please select a resume from your profile or '
+                          'provide a resume URL.'},
+                status=400,
+            )
+
+        # ---- Validate dynamic form responses ----
+        responses_payload = request.data.get('responses', []) or []
+        responses_by_field = {
+            int(r.get('field')): r.get('value')
+            for r in responses_payload if r.get('field') is not None
+        }
+
+        # Determine which fields apply: shared posting fields + role fields
+        applicable_fields = list(posting.form_fields.all())
+        if role is not None:
+            applicable_fields += list(role.form_fields.all())
+
+        ok, validation_error = _validate_form_responses(
+            applicable_fields, responses_by_field
+        )
+        if not ok:
+            return Response({'error': validation_error}, status=400)
+
+        # ---- Create application + responses ----
         application = create_job_application(student, posting)
+        application.job_role = role
+        application.resume_url = resume_url
+        application.selected_resume = selected_resume
+        # Snapshot contact details from the student's PlacementProfile so the
+        # TPO/recruiter has a stable record of how to reach the applicant.
+        if placement_profile:
+            application.applicant_email = placement_profile.professional_email
+            application.applicant_linkedin = placement_profile.linkedin_url
+            application.applicant_github = placement_profile.github_url
+        application.save(update_fields=[
+            'job_role', 'resume_url', 'selected_resume',
+            'applicant_email', 'applicant_linkedin', 'applicant_github',
+        ])
+
+        for field in applicable_fields:
+            if field.id in responses_by_field:
+                JobApplicationResponse.objects.create(
+                    application=application,
+                    field=field,
+                    value={'value': responses_by_field[field.id]},
+                )
+
+        # Notify placement officers that a new application has come in.
+        notify_new_application(request.user, application)
+
         return Response(
             JobApplicationSerializer(application).data,
             status=status.HTTP_201_CREATED
@@ -1001,7 +1395,11 @@ class JobApplicationViewSet(viewsets.ModelViewSet):
         application = self.get_object()
         new_status = request.data.get('status')
         remarks = request.data.get('remarks', '')
+        previous_status = application.status
         updated_app = update_job_application_status(application, new_status, remarks)
+        # Notify the student about the status change.
+        if new_status and new_status != previous_status:
+            notify_application_status_change(request.user, updated_app, new_status)
         return Response(JobApplicationSerializer(updated_app).data)
 
 
@@ -1028,9 +1426,11 @@ class JobOfferViewSet(viewsets.ModelViewSet):
         deadline = self.request.data.get('response_deadline')
         if not deadline:
             deadline = timezone.now() + timedelta(hours=48)
-            serializer.save(response_deadline=deadline)
+            offer = serializer.save(response_deadline=deadline)
         else:
-            serializer.save()
+            offer = serializer.save()
+        # Notify the student that an offer has been extended.
+        notify_offer_extended(self.request.user, offer)
 
     @action(detail=True, methods=['post'])
     def respond(self, request, pk=None):
@@ -1039,8 +1439,82 @@ class JobOfferViewSet(viewsets.ModelViewSet):
         action_type = request.data.get('action')
         success, message = process_offer_response(offer, action_type)
         if success:
+            offer.refresh_from_db()
+            if message == 'accepted':
+                notify_offer_accepted(request.user, offer)
             return Response({'status': message})
         return Response({'error': message}, status=400)
+
+
+class StudentResumeViewSet(viewsets.ModelViewSet):
+    """
+    API endpoint for managing a student's saved resumes (profile-based).
+    Each student can save up to ``StudentResume.MAX_RESUMES_PER_STUDENT``
+    resume links (Google Drive / external URL).
+    """
+    permission_classes = [IsAuthenticated]
+    serializer_class = StudentResumeSerializer
+
+    def _student(self):
+        profile = get_object_or_404(ExtraInfo, user=self.request.user)
+        return get_object_or_404(Student, id=profile)
+
+    def get_queryset(self):
+        user = self.request.user
+        if is_tpo_or_chairman(user):
+            student_id = self.request.query_params.get('student')
+            qs = StudentResume.objects.all()
+            if student_id:
+                qs = qs.filter(student_id=student_id)
+            return qs
+        try:
+            student = self._student()
+        except Exception:
+            return StudentResume.objects.none()
+        return StudentResume.objects.filter(student=student)
+
+    def perform_create(self, serializer):
+        student = self._student()
+        if StudentResume.objects.filter(student=student).count() >= \
+                StudentResume.MAX_RESUMES_PER_STUDENT:
+            raise serializers_exception('You can save at most {} resumes.'.format(
+                StudentResume.MAX_RESUMES_PER_STUDENT
+            ))
+        # If first resume or marked default, ensure default uniqueness.
+        is_default = serializer.validated_data.get('is_default', False)
+        if is_default:
+            StudentResume.objects.filter(
+                student=student, is_default=True
+            ).update(is_default=False)
+        serializer.save(student=student)
+
+    def perform_update(self, serializer):
+        student = self._student()
+        is_default = serializer.validated_data.get('is_default', None)
+        if is_default:
+            StudentResume.objects.filter(
+                student=student, is_default=True
+            ).exclude(pk=serializer.instance.pk).update(is_default=False)
+        serializer.save()
+
+    @action(detail=True, methods=['post'])
+    def make_default(self, request, pk=None):
+        resume = self.get_object()
+        student = self._student()
+        if resume.student_id != student.id:
+            return Response({'error': 'Not your resume.'}, status=403)
+        StudentResume.objects.filter(student=student, is_default=True).update(
+            is_default=False
+        )
+        resume.is_default = True
+        resume.save(update_fields=['is_default'])
+        return Response(StudentResumeSerializer(resume).data)
+
+
+def serializers_exception(message):
+    """Tiny helper to raise a DRF validation error from imperative code."""
+    from rest_framework import serializers as _s
+    raise _s.ValidationError({'detail': message})
 
 
 class AppealViewSet(viewsets.ModelViewSet):
@@ -1091,12 +1565,52 @@ class AnnouncementViewSet(viewsets.ModelViewSet):
     """API endpoint for announcements."""
     permission_classes = [IsAuthenticated]
     serializer_class = AnnouncementSerializer
-    queryset = Announcement.objects.filter(is_active=True)
+    queryset = Announcement.objects.all()
+
+    def get_queryset(self):
+        user = self.request.user
+        qs = Announcement.objects.all()
+        now = timezone.now()
+
+        if not is_tpo_or_chairman(user):
+            qs = qs.filter(
+                is_active=True,
+                publish_at__lte=now,
+            ).filter(
+                Q(expires_at__isnull=True) | Q(expires_at__gt=now)
+            )
+
+        notice_type = self.request.query_params.get('notice_type')
+        visibility_scope = self.request.query_params.get('visibility_scope')
+        if notice_type:
+            qs = qs.filter(notice_type=notice_type.upper())
+        if visibility_scope:
+            qs = qs.filter(visibility_scope=visibility_scope.upper())
+
+        return qs.annotate(
+            priority_rank=Case(
+                When(priority='HIGH', then=Value(1)),
+                default=Value(0),
+                output_field=IntegerField(),
+            )
+        ).order_by('-priority_rank', '-publish_at', '-created_at')
 
     def perform_create(self, serializer):
         if not _is_tpo_or_chairman(self.request.user):
             raise PermissionError("Not authorized")
-        serializer.save(created_by=self.request.user)
+        announcement = serializer.save(created_by=self.request.user)
+        # Notify all students about the new announcement.
+        notify_announcement(self.request.user, announcement)
+
+    def perform_update(self, serializer):
+        if not _is_tpo_or_chairman(self.request.user):
+            raise PermissionError("Not authorized")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        if not _is_tpo_or_chairman(self.request.user):
+            raise PermissionError("Not authorized")
+        instance.delete()
 
 
 # =============================================
@@ -1747,7 +2261,8 @@ class PlacementProfileViewSet(viewsets.ModelViewSet):
         changes = {}
         # Only log fields that we care about
         fields_to_track = ['resume', 'about_me', 'linkedin_url', 'portfolio_url',
-                           'github_url', 'achievements', 'certifications']
+                           'github_url', 'professional_email', 'achievements',
+                           'certifications']
 
         for field in fields_to_track:
             old_value = old_data.get(field)
@@ -1764,6 +2279,351 @@ class PlacementProfileViewSet(viewsets.ModelViewSet):
                 changed_by=self.request.user,
                 changes=changes
             )
+
+
+class PlacementClaimViewSet(viewsets.ModelViewSet):
+    """
+    Manage student placement / internship claims.
+
+    Students can:
+      - list their own claims (any status)
+      - submit a new claim (always saved as PENDING)
+      - delete their own PENDING claims (a verified claim can only be
+        modified or removed by the TPO/Chairman)
+
+    The TPO / Placement Chairman can:
+      - list all claims (filterable by status, kind, student)
+      - create a claim on behalf of a student (auto-VERIFIED)
+      - PATCH / verify / reject any claim
+      - DELETE any claim
+      - toggle the student's `apply_override` via the dedicated action
+    """
+    serializer_class = PlacementClaimSerializer
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [TokenAuthentication]
+
+    def get_queryset(self):
+        user = self.request.user
+        qs = PlacementClaim.objects.select_related(
+            'student__id__user', 'verified_by', 'created_by'
+        )
+        if is_tpo_or_chairman(user):
+            student_id = self.request.query_params.get('student')
+            kind = self.request.query_params.get('kind')
+            status_filter = self.request.query_params.get('status')
+            if student_id:
+                qs = qs.filter(student_id=student_id)
+            if kind:
+                qs = qs.filter(kind=kind.upper())
+            if status_filter:
+                qs = qs.filter(status=status_filter.upper())
+            return qs
+        # Student: only their own claims.
+        try:
+            student = Student.objects.get(id__user=user)
+        except Student.DoesNotExist:
+            return PlacementClaim.objects.none()
+        return qs.filter(student=student)
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        if is_tpo_or_chairman(user):
+            # TPO can pick any student and the claim is auto-verified.
+            student = serializer.validated_data.get('student')
+            if not student:
+                raise serializers.ValidationError({'student': 'Required.'})
+            serializer.save(
+                created_by=user,
+                status=PlacementClaim.STATUS_VERIFIED,
+                verified_by=user,
+                verified_at=timezone.now(),
+            )
+        else:
+            # Student-submitted claim is always pending.
+            try:
+                student = Student.objects.get(id__user=user)
+            except Student.DoesNotExist:
+                raise serializers.ValidationError(
+                    {'detail': 'Student profile not found.'}
+                )
+            serializer.save(
+                student=student,
+                created_by=user,
+                status=PlacementClaim.STATUS_PENDING,
+                verified_by=None,
+                verified_at=None,
+            )
+
+    def perform_update(self, serializer):
+        user = self.request.user
+        if not is_tpo_or_chairman(user):
+            # Students may only edit their own PENDING claims and may not
+            # change verification fields.
+            instance = self.get_object()
+            if instance.status != PlacementClaim.STATUS_PENDING:
+                raise PermissionDenied(
+                    'Only the TPO can modify a verified or rejected claim.'
+                )
+            for protected in ('status', 'verified_by', 'verified_at',
+                              'verification_remarks'):
+                serializer.validated_data.pop(protected, None)
+            serializer.save()
+            return
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        user = self.request.user
+        if is_tpo_or_chairman(user):
+            instance.delete()
+            return
+        if instance.status != PlacementClaim.STATUS_PENDING:
+            raise PermissionDenied(
+                'Only the TPO can remove a verified or rejected claim.'
+            )
+        # Student is only allowed to remove their own pending claim.
+        try:
+            student = Student.objects.get(id__user=user)
+        except Student.DoesNotExist:
+            raise PermissionDenied('Not allowed.')
+        if instance.student_id != student.id:
+            raise PermissionDenied('Not your claim.')
+        instance.delete()
+
+    @action(detail=True, methods=['post'])
+    def verify(self, request, pk=None):
+        """TPO marks the claim as verified."""
+        if not is_tpo_or_chairman(request.user):
+            return Response({'error': 'Not authorized'}, status=403)
+        claim = self.get_object()
+        claim.status = PlacementClaim.STATUS_VERIFIED
+        claim.verification_remarks = request.data.get(
+            'verification_remarks', claim.verification_remarks
+        )
+        claim.verified_by = request.user
+        claim.verified_at = timezone.now()
+        claim.save()
+        return Response(PlacementClaimSerializer(claim).data)
+
+    @action(detail=True, methods=['post'])
+    def reject(self, request, pk=None):
+        """TPO marks the claim as rejected."""
+        if not is_tpo_or_chairman(request.user):
+            return Response({'error': 'Not authorized'}, status=403)
+        claim = self.get_object()
+        claim.status = PlacementClaim.STATUS_REJECTED
+        claim.verification_remarks = request.data.get(
+            'verification_remarks', claim.verification_remarks
+        )
+        claim.verified_by = request.user
+        claim.verified_at = timezone.now()
+        claim.save()
+        return Response(PlacementClaimSerializer(claim).data)
+
+    @action(detail=False, methods=['post'], url_path='clear-status')
+    def clear_status(self, request):
+        """
+        TPO clears (hard-deletes) a student's verified placement and/or
+        internship claims so the student is treated as unplaced again.
+
+        Body: {
+            "student": <student_pk>,
+            "kind": "PLACEMENT" | "INTERNSHIP" | "ALL"   # optional, defaults to ALL
+        }
+        Returns the number of claims removed.
+        """
+        if not is_tpo_or_chairman(request.user):
+            return Response({'error': 'Not authorized'}, status=403)
+
+        student_id = request.data.get('student')
+        if not student_id:
+            return Response({'error': 'student is required'}, status=400)
+        try:
+            student = Student.objects.get(pk=student_id)
+        except Student.DoesNotExist:
+            return Response({'error': 'Student not found'}, status=404)
+
+        kind = (request.data.get('kind') or 'ALL').upper()
+        qs = PlacementClaim.objects.filter(
+            student=student,
+            status=PlacementClaim.STATUS_VERIFIED,
+        )
+        if kind in (PlacementClaim.KIND_PLACEMENT, PlacementClaim.KIND_INTERNSHIP):
+            qs = qs.filter(kind=kind)
+        elif kind != 'ALL':
+            return Response(
+                {'error': "kind must be PLACEMENT, INTERNSHIP, or ALL"},
+                status=400,
+            )
+
+        deleted, _ = qs.delete()
+        return Response({
+            'student': student.id.id,
+            'kind': kind,
+            'deleted': deleted,
+        })
+
+    @action(detail=False, methods=['post'], url_path='set-apply-override')
+    def set_apply_override(self, request):
+        """
+        TPO toggles the apply_override on a student's PlacementProfile.
+
+        Body: { "student": <student_id>, "apply_override": true/false,
+                "remarks": "..." }
+        """
+        if not is_tpo_or_chairman(request.user):
+            return Response({'error': 'Not authorized'}, status=403)
+        student_id = request.data.get('student')
+        if not student_id:
+            return Response({'error': 'student is required'}, status=400)
+        try:
+            student = Student.objects.get(pk=student_id)
+        except Student.DoesNotExist:
+            return Response({'error': 'Student not found'}, status=404)
+        profile, _ = PlacementProfile.objects.get_or_create(student=student)
+        profile.apply_override = bool(request.data.get('apply_override', False))
+        profile.apply_override_remarks = request.data.get('remarks', '')
+        profile.save(update_fields=['apply_override', 'apply_override_remarks'])
+        return Response({
+            'student': student.id.id,
+            'apply_override': profile.apply_override,
+            'apply_override_remarks': profile.apply_override_remarks,
+        })
+
+    @action(detail=False, methods=['get'])
+    def students(self, request):
+        """
+        TPO-only directory of students with their current placement status,
+        used by the Placement Status admin tab.
+
+        Query params (all optional):
+          - q: substring search on name / roll / username
+          - status: ALL | PLACED | INTERNING | UNPLACED | PENDING | OVERRIDE
+          - page: 1-based page number (default 1)
+          - page_size: items per page (default 25, max 200)
+
+        Response shape:
+          {
+            "count": <total>,
+            "page": <current page>,
+            "page_size": <effective page size>,
+            "num_pages": <total pages>,
+            "results": [ {student row}, ... ]
+          }
+
+        The whole list is computed at the database level using annotations
+        (no N+1 per-row queries), so it scales to thousands of students.
+        """
+        if not is_tpo_or_chairman(request.user):
+            return Response({'error': 'Not authorized'}, status=403)
+
+        q = (request.query_params.get('q') or '').strip()
+        status_filter = (request.query_params.get('status') or 'ALL').upper()
+        try:
+            page = max(int(request.query_params.get('page', 1)), 1)
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            page_size = min(
+                max(int(request.query_params.get('page_size', 25)), 1),
+                200,
+            )
+        except (TypeError, ValueError):
+            page_size = 25
+
+        # Single annotated queryset — no per-row queries.
+        verified_filter = Q(
+            placement_claims__status=PlacementClaim.STATUS_VERIFIED
+        )
+        qs = (
+            Student.objects
+            .select_related('id__user', 'placement_profile')
+            .annotate(
+                placed_count=Count(
+                    'placement_claims',
+                    filter=verified_filter & Q(
+                        placement_claims__kind=PlacementClaim.KIND_PLACEMENT
+                    ),
+                    distinct=True,
+                ),
+                interning_count=Count(
+                    'placement_claims',
+                    filter=verified_filter & Q(
+                        placement_claims__kind=PlacementClaim.KIND_INTERNSHIP
+                    ),
+                    distinct=True,
+                ),
+                pending_count=Count(
+                    'placement_claims',
+                    filter=Q(
+                        placement_claims__status=PlacementClaim.STATUS_PENDING
+                    ),
+                    distinct=True,
+                ),
+            )
+        )
+
+        # Drop students with no linked User account up front.
+        qs = qs.filter(id__user__isnull=False)
+
+        if q:
+            qs = qs.filter(
+                Q(id__id__icontains=q)
+                | Q(id__user__username__icontains=q)
+                | Q(id__user__first_name__icontains=q)
+                | Q(id__user__last_name__icontains=q)
+            )
+
+        if status_filter == 'PLACED':
+            qs = qs.filter(placed_count__gt=0)
+        elif status_filter == 'INTERNING':
+            qs = qs.filter(interning_count__gt=0)
+        elif status_filter == 'UNPLACED':
+            qs = qs.filter(placed_count=0, interning_count=0)
+        elif status_filter == 'PENDING':
+            qs = qs.filter(pending_count__gt=0)
+        elif status_filter == 'OVERRIDE':
+            qs = qs.filter(placement_profile__apply_override=True)
+        # 'ALL' (or anything else) -> no extra filter.
+
+        # Sort: pending first, then placed/interning, then alphabetical.
+        qs = qs.order_by(
+            '-pending_count', '-placed_count', '-interning_count',
+            'id__user__first_name', 'id__user__last_name', 'id__id',
+        )
+
+        paginator = Paginator(qs, page_size)
+        page_obj = paginator.get_page(page)
+
+        results = []
+        for s in page_obj.object_list:
+            user = s.id.user
+            try:
+                profile = s.placement_profile
+            except PlacementProfile.DoesNotExist:
+                profile = None
+            results.append({
+                'student': s.id.id,
+                'student_pk': s.pk,
+                'name': '{} {}'.format(
+                    user.first_name or '', user.last_name or ''
+                ).strip() or user.username,
+                'username': user.username,
+                'has_placement': s.placed_count > 0,
+                'has_internship': s.interning_count > 0,
+                'pending_claims': s.pending_count,
+                'apply_override': bool(profile and profile.apply_override),
+                'apply_override_remarks': (
+                    profile.apply_override_remarks if profile else ''
+                ),
+            })
+
+        return Response({
+            'count': paginator.count,
+            'page': page_obj.number,
+            'page_size': page_size,
+            'num_pages': paginator.num_pages,
+            'results': results,
+        })
 
 
 # =============================================
