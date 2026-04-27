@@ -7,7 +7,7 @@ import logging
 
 from datetime import date
 from django.contrib.auth.models import User
-from django.db.models import Avg, Count, Max, Min, Q, Sum
+from django.db.models import Avg, Case, Count, IntegerField, Max, Min, Q, Sum, Value, When
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 
@@ -21,7 +21,7 @@ from applications.placement_cell.models import (
     Skill, StudentPlacement, StudentRecord, Role, CompanyDetails,
     Company, JobPosting, JobApplication, InterviewSchedule,
     InterviewPanel, JobOffer, Announcement, PlacementPolicy,
-    Coauthor, Coinventor, AlumniProfile,
+    Coauthor, Coinventor, AlumniProfile, PlacementProfile, PlacementClaim,
 )
 
 
@@ -208,36 +208,97 @@ def delete_placement_schedule(schedule):
 # STUDENT RECORDS & CV SERVICES
 # =============================================
 
-def get_all_students_with_placement_info():
+def get_all_students_with_placement_info(
+    *, q=None, department=None, page=1, page_size=25,
+):
     """
-    Get all students with their profile and placement information.
-    Returns a list of dicts with student data.
+    Paginated list of students with their profile / placement information.
+
+    All filtering and pagination happens at the database layer to avoid the
+    O(N) per-row queries the legacy implementation was making (which
+    dominated load time once the institute roster grew).
+
+    Returns a dict matching the standard "DRF-paginated" shape:
+        {
+          "count": <total matching>,
+          "page": <current page>,
+          "page_size": <effective page size>,
+          "num_pages": <total pages>,
+          "results": [ <row dict>, ... ],
+        }
     """
-    students = Student.objects.select_related('id', 'id__user', 'id__department').all()
+    from django.core.paginator import Paginator
 
-    data = []
-    for student in students:
-        try:
-            sp = StudentPlacement.objects.get(unique_id=student)
-            debar = sp.debar
-            placed = sp.placed_type
-        except StudentPlacement.DoesNotExist:
-            debar = 'NOT DEBAR'
-            placed = 'NOT PLACED'
+    try:
+        page = max(int(page or 1), 1)
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        page_size = min(max(int(page_size or 25), 1), 200)
+    except (TypeError, ValueError):
+        page_size = 25
 
-        data.append({
+    qs = (
+        Student.objects
+        .select_related('id', 'id__user', 'id__department', 'studentplacement')
+        .filter(id__user__isnull=False)
+    )
+
+    if q:
+        q = str(q).strip()
+        if q:
+            qs = qs.filter(
+                Q(id__id__icontains=q)
+                | Q(id__user__username__icontains=q)
+                | Q(id__user__first_name__icontains=q)
+                | Q(id__user__last_name__icontains=q)
+            )
+
+    if department:
+        qs = qs.filter(id__department__name=department)
+
+    qs = qs.order_by('id__user__first_name', 'id__user__last_name', 'id__id')
+
+    paginator = Paginator(qs, page_size)
+    page_obj = paginator.get_page(page)
+
+    results = []
+    for student in page_obj.object_list:
+        sp = getattr(student, 'studentplacement', None)
+        results.append({
             'id': student.id.id,
-            'name': '{} {}'.format(student.id.user.first_name, student.id.user.last_name),
+            'name': '{} {}'.format(
+                student.id.user.first_name, student.id.user.last_name
+            ).strip(),
             'roll_no': student.id.id,
-            'department': student.id.department.name if student.id.department else '',
+            'department': (
+                student.id.department.name if student.id.department else ''
+            ),
             'programme': student.programme or '',
             'batch': student.batch,
             'cpi': student.cpi,
-            'debar': debar,
-            'placed': placed,
+            'debar': sp.debar if sp else 'NOT DEBAR',
+            'placed': sp.placed_type if sp else 'NOT PLACED',
         })
 
-    return data
+    return {
+        'count': paginator.count,
+        'page': page_obj.number,
+        'page_size': page_size,
+        'num_pages': paginator.num_pages,
+        'results': results,
+    }
+
+
+def get_student_record_departments():
+    """Distinct department names that appear on the student roster."""
+    return list(
+        Student.objects
+        .filter(id__department__isnull=False)
+        .values_list('id__department__name', flat=True)
+        .distinct()
+        .order_by('id__department__name')
+    )
 
 
 def get_student_cv_data(target_user):
@@ -600,18 +661,35 @@ def check_eligibility(student, job_posting):
                 )
 
     # 5. Check batch eligibility
-    if job_posting.eligible_batch_from and student.batch < job_posting.eligible_batch_from:
-        reasons.append(
-            "Minimum batch year: {}. Your batch: {}.".format(
-                job_posting.eligible_batch_from, student.batch
+    eligible_batches = getattr(job_posting, 'eligible_batches', None) or []
+    # Coerce to a list of ints (JSONField may store strings or ints)
+    try:
+        eligible_batch_years = [int(b) for b in eligible_batches if str(b).strip()]
+    except (TypeError, ValueError):
+        eligible_batch_years = []
+
+    if eligible_batch_years:
+        if student.batch not in eligible_batch_years:
+            reasons.append(
+                "Your batch ({}) is not eligible. Eligible batches: {}.".format(
+                    student.batch,
+                    ", ".join(str(y) for y in sorted(eligible_batch_years)),
+                )
             )
-        )
-    if job_posting.eligible_batch_to and student.batch > job_posting.eligible_batch_to:
-        reasons.append(
-            "Maximum batch year: {}. Your batch: {}.".format(
-                job_posting.eligible_batch_to, student.batch
+    else:
+        # Backward compatibility with the deprecated range fields.
+        if job_posting.eligible_batch_from and student.batch < job_posting.eligible_batch_from:
+            reasons.append(
+                "Minimum batch year: {}. Your batch: {}.".format(
+                    job_posting.eligible_batch_from, student.batch
+                )
             )
-        )
+        if job_posting.eligible_batch_to and student.batch > job_posting.eligible_batch_to:
+            reasons.append(
+                "Maximum batch year: {}. Your batch: {}.".format(
+                    job_posting.eligible_batch_to, student.batch
+                )
+            )
 
     # 6. Check required skills
     if job_posting.required_skills.exists():
@@ -646,11 +724,55 @@ def check_duplicate_application(student, job_posting):
     ).exists()
 
 
+def _kind_for_posting(job_posting):
+    """Map a JobPosting.job_type to the matching PlacementClaim.kind."""
+    if job_posting.job_type == 'INTERNSHIP':
+        return PlacementClaim.KIND_INTERNSHIP
+    return PlacementClaim.KIND_PLACEMENT
+
+
+def has_verified_placement(student, kind):
+    """Return True if student has any VERIFIED PlacementClaim of the given kind."""
+    return PlacementClaim.objects.filter(
+        student=student,
+        kind=kind,
+        status=PlacementClaim.STATUS_VERIFIED,
+    ).exists()
+
+
 def check_placement_policy(student, job_posting):
     """
-    Enforce placement policies (e.g., max offers, dream company rules).
-    Returns (can_apply: bool, reason: str)
+    Enforce placement policies. Returns (can_apply: bool, reason: str).
+
+    Two layers are evaluated:
+
+    1. Hard "already placed" gate based on VERIFIED PlacementClaim records
+       (separate per kind: a placed student is only blocked from new
+       PLACEMENT postings, not from internships, and vice versa). The TPO
+       can override this by setting ``apply_override`` on the student's
+       PlacementProfile.
+
+    2. The legacy PlacementPolicy (max accepted offers, dream company
+       threshold) for any remaining policy enforcement.
     """
+    kind = _kind_for_posting(job_posting)
+
+    # 1. Already-placed gate, with optional TPO override.
+    if has_verified_placement(student, kind):
+        try:
+            placement_profile = student.placement_profile
+        except PlacementProfile.DoesNotExist:
+            placement_profile = None
+        if not (placement_profile and placement_profile.apply_override):
+            label = 'placement' if kind == PlacementClaim.KIND_PLACEMENT else 'internship'
+            return False, (
+                "You are already marked as having a verified {label}. "
+                "Please contact the TPO if you need to apply to additional {label} postings.".format(
+                    label=label,
+                )
+            )
+
+    # 2. Legacy PlacementPolicy.
     active_policy = PlacementPolicy.objects.filter(is_active=True).first()
     if not active_policy:
         return True, ""
@@ -719,12 +841,37 @@ def process_offer_response(offer, action_type):
         offer.application.status = 'OFFER_ACCEPTED'
         offer.application.save()
 
-        # Update StudentPlacement
+        # Update StudentPlacement (legacy)
         sp, created = StudentPlacement.objects.get_or_create(unique_id=student)
         sp.placed_type = 'PLACED'
         sp.placement_date = datetime.date.today()
         sp.package = offer.ctc_offered
         sp.save()
+
+        # Record a verified PlacementClaim so the student is automatically
+        # treated as placed/interning, and the TPO sees a single source of
+        # truth in the Placement Status tab. Avoid duplicating if there's
+        # already a claim tied to this offer.
+        kind = _kind_for_posting(offer.application.job_posting)
+        PlacementClaim.objects.update_or_create(
+            related_offer=offer,
+            defaults={
+                'student': student,
+                'kind': kind,
+                'company_name': offer.application.job_posting.company.name,
+                'role_title': (
+                    offer.application.job_role.title
+                    if offer.application.job_role else
+                    offer.application.job_posting.title
+                ),
+                'compensation_amount': offer.ctc_offered,
+                'duration_months': offer.application.job_posting.internship_duration_months,
+                'source': PlacementClaim.SOURCE_ONCAMPUS,
+                'status': PlacementClaim.STATUS_VERIFIED,
+                'verified_at': timezone.now(),
+                'notes': 'Auto-created from accepted job offer.',
+            },
+        )
 
         return True, 'accepted'
 
@@ -969,9 +1116,30 @@ def get_form_field_config():
 # ANNOUNCEMENT SERVICES
 # =============================================
 
-def get_active_announcements(limit=None):
-    """Get active announcements, optionally limited."""
-    qs = Announcement.objects.filter(is_active=True)
+def get_active_announcements(limit=None, notice_type=None, visibility_scope=None):
+    """Get active announcements with lifecycle-aware ordering."""
+    now = timezone.now()
+    qs = Announcement.objects.filter(
+        is_active=True,
+        publish_at__lte=now,
+    ).filter(
+        Q(expires_at__isnull=True) | Q(expires_at__gt=now)
+    )
+
+    if notice_type:
+        qs = qs.filter(notice_type=notice_type)
+
+    if visibility_scope:
+        qs = qs.filter(visibility_scope=visibility_scope)
+
+    qs = qs.annotate(
+        priority_rank=Case(
+            When(priority='HIGH', then=Value(1)),
+            default=Value(0),
+            output_field=IntegerField(),
+        )
+    ).order_by('-priority_rank', '-publish_at', '-created_at')
+
     if limit:
         qs = qs[:limit]
     return qs
