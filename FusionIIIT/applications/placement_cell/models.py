@@ -4,6 +4,7 @@ from django.utils import timezone
 from django.utils.translation import gettext as _
 
 from applications.academic_information.models import Student
+from django.contrib.auth.models import User
 
 # Class definations:
 
@@ -79,6 +80,89 @@ class Constants:
         ('ECE','ECE'),
         ('DESIGN', 'DESIGN'),
         ('NS', 'NS'),
+    )
+
+    # ---- PCMS New Constants ----
+
+    COMPANY_APPROVAL_STATUS = (
+        ('PENDING', 'Pending'),
+        ('APPROVED', 'Approved'),
+        ('REJECTED', 'Rejected'),
+    )
+
+    JOB_TYPE = (
+        ('PLACEMENT', 'Placement'),
+        ('INTERNSHIP', 'Internship'),
+        ('PBI', 'PBI'),
+    )
+
+    COMPENSATION_TYPE = (
+        ('LPA', 'Annual CTC (LPA)'),
+        ('STIPEND_PER_MONTH', 'Stipend (per month)'),
+    )
+
+    APPLICATION_STATUS = (
+        ('APPLIED', 'Applied'),
+        ('SHORTLISTED', 'Shortlisted'),
+        ('INTERVIEW_SCHEDULED', 'Interview Scheduled'),
+        ('OFFER_EXTENDED', 'Offer Extended'),
+        ('OFFER_ACCEPTED', 'Offer Accepted'),
+        ('OFFER_REJECTED', 'Offer Rejected'),
+        ('REJECTED', 'Rejected'),
+    )
+
+    INTERVIEW_MODE = (
+        ('ONLINE', 'Online'),
+        ('OFFLINE', 'Offline'),
+    )
+
+    INTERVIEW_RESULT = (
+        ('PENDING', 'Pending'),
+        ('SELECTED', 'Selected'),
+        ('REJECTED', 'Rejected'),
+        ('WAITLISTED', 'Waitlisted'),
+    )
+
+    OFFER_STATUS = (
+        ('PENDING', 'Pending'),
+        ('ACCEPTED', 'Accepted'),
+        ('REJECTED', 'Rejected'),
+        ('EXPIRED', 'Expired'),
+    )
+
+    ANNOUNCEMENT_TYPE = (
+        ('PLACEMENT_DRIVE', 'Placement Drive'),
+        ('COMPANY_VISIT', 'Company Visit'),
+        ('TRAINING_SESSION', 'Training Session'),
+        ('WORKSHOP', 'Workshop'),
+        ('INTERNSHIP', 'Internship Program'),
+        ('GENERAL', 'General'),
+    )
+
+    NOTICE_TYPE = (
+        ('PLACEMENT', 'Placement'),
+        ('POLICY', 'Policy'),
+        ('GENERAL', 'General'),
+    )
+
+    NOTICE_PRIORITY = (
+        ('HIGH', 'High'),
+        ('NORMAL', 'Normal'),
+    )
+
+    NOTICE_VISIBILITY_SCOPE = (
+        ('ALL', 'All'),
+        ('SPECIFIC_BATCH', 'Specific Batch'),
+    )
+
+    # ---- Dynamic Job Form Constants ----
+
+    JOB_FORM_FIELD_TYPE = (
+        ('SHORT_ANSWER', 'Short Answer'),
+        ('LONG_ANSWER', 'Long Answer'),
+        ('NUMBER', 'Number'),
+        ('SINGLE_CHOICE', 'Single Choice'),
+        ('MULTI_CHOICE', 'Multiple Choice'),
     )
 
 
@@ -399,3 +483,922 @@ class StudentPlacement(models.Model):
 
     def __str__(self):
         return self.unique_id.id.id
+
+
+# =============================================
+# PCMS NEW MODELS
+# =============================================
+
+class Company(models.Model):
+    """
+    Represents a recruiting company registered on the placement system.
+    Companies register and are subject to approval by the TPO.
+    """
+    name = models.CharField(max_length=200)
+    website = models.URLField(max_length=300, blank=True, null=True)
+    description = models.TextField(max_length=2000, blank=True, null=True)
+    domain = models.CharField(max_length=200, blank=True, null=True,
+                              help_text="Industry domain, e.g., IT, Finance, Manufacturing")
+    contact_person_name = models.CharField(max_length=200, blank=True, null=True)
+    contact_email = models.EmailField(max_length=200)
+    contact_phone = models.CharField(max_length=20, blank=True, null=True)
+    address = models.TextField(max_length=500, blank=True, null=True)
+    logo = models.ImageField(upload_to='placement/company_logos/', blank=True, null=True)
+    approval_status = models.CharField(
+        max_length=20,
+        choices=Constants.COMPANY_APPROVAL_STATUS,
+        default='PENDING'
+    )
+    approved_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='approved_companies'
+    )
+    registered_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='registered_companies',
+        help_text="The TPO/user who registered this company"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name_plural = "Companies"
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return self.name
+
+
+class JobPosting(models.Model):
+    """
+    Represents a job or internship opportunity posted by a company.
+    TPO uploads postings on behalf of companies. Includes eligibility criteria.
+    """
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name='job_postings')
+    title = models.CharField(max_length=200, help_text="Job title / role name")
+    description = models.TextField(max_length=3000)
+    job_type = models.CharField(max_length=20, choices=Constants.JOB_TYPE, default='PLACEMENT')
+    location = models.CharField(max_length=200, blank=True, null=True)
+    ctc = models.DecimalField(
+        decimal_places=2, max_digits=10,
+        help_text="Compensation amount. Interpreted as LPA when "
+                  "compensation_type='LPA' and as stipend per month when "
+                  "compensation_type='STIPEND_PER_MONTH'."
+    )
+    compensation_type = models.CharField(
+        max_length=30, choices=Constants.COMPENSATION_TYPE, default='LPA',
+        help_text="How `ctc` should be interpreted (annual CTC vs monthly stipend)."
+    )
+    internship_duration_months = models.PositiveSmallIntegerField(
+        null=True, blank=True,
+        help_text="Duration in months for internships (optional)."
+    )
+    jd_link = models.URLField(
+        max_length=1000, blank=True, null=True,
+        help_text="Optional external job description link."
+    )
+    bond_details = models.TextField(max_length=500, blank=True, null=True)
+
+    # Eligibility criteria
+    min_cpi = models.FloatField(default=0.0, help_text="Minimum CPI required")
+    eligible_programmes = models.CharField(
+        max_length=200, blank=True, null=True,
+        help_text="Comma-separated: B.Tech,M.Tech,B.Des,M.Des,PhD"
+    )
+    eligible_branches = models.CharField(
+        max_length=300, blank=True, null=True,
+        help_text="Comma-separated: CSE,ECE,ME,SM,DESIGN"
+    )
+    eligible_batch_from = models.IntegerField(
+        null=True, blank=True,
+        help_text="(Deprecated) Minimum batch year — use eligible_batches instead."
+    )
+    eligible_batch_to = models.IntegerField(
+        null=True, blank=True,
+        help_text="(Deprecated) Maximum batch year — use eligible_batches instead."
+    )
+    eligible_batches = models.JSONField(
+        default=list, blank=True, null=True,
+        help_text="List of batch years eligible to apply, e.g. [2023, 2024]. "
+                  "If empty, all batches are eligible."
+    )
+    required_skills = models.ManyToManyField(Skill, blank=True, related_name='required_for_jobs')
+    backlog_allowed = models.BooleanField(default=False)
+
+    # Deadlines & status
+    application_deadline = models.DateTimeField()
+    is_active = models.BooleanField(default=True)
+    posted_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='posted_jobs',
+        help_text="TPO who posted this"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    attached_file = models.FileField(
+        upload_to='documents/placement/job_postings/', null=True, blank=True
+    )
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return '{} - {}'.format(self.company.name, self.title)
+
+    @property
+    def is_deadline_passed(self):
+        return timezone.now() > self.application_deadline
+
+    @property
+    def total_applications(self):
+        return self.applications.count()
+
+
+class JobRole(models.Model):
+    """
+    A specific job role/title within a JobPosting.
+    A single posting can list multiple roles (e.g., SDE, Data Analyst, ML Engineer).
+    Each role can optionally have a role-specific dynamic form. If no role-specific
+    fields exist, the posting-level shared form is used.
+    """
+    job_posting = models.ForeignKey(
+        JobPosting, on_delete=models.CASCADE, related_name='roles'
+    )
+    title = models.CharField(max_length=200, help_text="Role/title name")
+    description = models.TextField(max_length=2000, blank=True, null=True)
+    seats = models.PositiveIntegerField(
+        default=0, help_text="Number of openings; 0 = unspecified"
+    )
+    ctc = models.DecimalField(
+        decimal_places=2, max_digits=10, null=True, blank=True,
+        help_text="Role-specific CTC/stipend override; falls back to posting CTC if null"
+    )
+    compensation_type = models.CharField(
+        max_length=30, choices=Constants.COMPENSATION_TYPE,
+        null=True, blank=True,
+        help_text="Override for compensation interpretation; falls back to "
+                  "posting compensation_type if null."
+    )
+    internship_duration_months = models.PositiveSmallIntegerField(
+        null=True, blank=True,
+        help_text="Role-specific internship duration override (in months)."
+    )
+    order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['order', 'id']
+
+    def __str__(self):
+        return '{} - {}'.format(self.job_posting.title, self.title)
+
+
+class JobFormField(models.Model):
+    """
+    A dynamic form field attached to a JobPosting (shared) or to a specific
+    JobRole (role-specific). Supports text/number/choice fields with required toggle.
+    Image upload is intentionally not supported.
+    """
+    job_posting = models.ForeignKey(
+        JobPosting, on_delete=models.CASCADE,
+        related_name='form_fields', null=True, blank=True,
+        help_text="Posting-level (shared) field; null when role-specific"
+    )
+    job_role = models.ForeignKey(
+        JobRole, on_delete=models.CASCADE,
+        related_name='form_fields', null=True, blank=True,
+        help_text="Role-specific field; null when shared at posting level"
+    )
+    label = models.CharField(max_length=300)
+    help_text = models.CharField(max_length=500, blank=True, null=True)
+    field_type = models.CharField(
+        max_length=20, choices=Constants.JOB_FORM_FIELD_TYPE
+    )
+    is_required = models.BooleanField(default=False)
+    order = models.PositiveIntegerField(default=0)
+    # For NUMBER fields
+    min_value = models.FloatField(null=True, blank=True)
+    max_value = models.FloatField(null=True, blank=True)
+    # For SHORT_ANSWER / LONG_ANSWER fields
+    max_length = models.PositiveIntegerField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['order', 'id']
+
+    def __str__(self):
+        owner = self.job_role or self.job_posting
+        return '{} | {}'.format(owner, self.label)
+
+
+class JobFormFieldOption(models.Model):
+    """
+    Choice option for SINGLE_CHOICE / MULTI_CHOICE form fields.
+    """
+    field = models.ForeignKey(
+        JobFormField, on_delete=models.CASCADE, related_name='options'
+    )
+    label = models.CharField(max_length=300)
+    value = models.CharField(max_length=300, blank=True, null=True)
+    order = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ['order', 'id']
+
+    def __str__(self):
+        return '{} :: {}'.format(self.field.label, self.label)
+
+
+class StudentResume(models.Model):
+    """
+    Profile-based resume for a student. Each student can save up to a few
+    resumes (e.g., "Backend Resume", "ML Resume") with an external link
+    (Google Drive / any URL). Selected at apply-time instead of file upload.
+    """
+    MAX_RESUMES_PER_STUDENT = 4
+
+    student = models.ForeignKey(
+        Student, on_delete=models.CASCADE, related_name='saved_resumes'
+    )
+    name = models.CharField(
+        max_length=100,
+        help_text="Custom name/type, e.g. 'Backend Resume'"
+    )
+    url = models.URLField(max_length=1000, help_text="External resume URL")
+    is_default = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-is_default', '-updated_at']
+
+    def __str__(self):
+        return '{} - {}'.format(self.student.id.user.username, self.name)
+
+
+class JobApplication(models.Model):
+    """
+    Tracks a student's application to a specific job posting.
+    Status moves through the pipeline: Applied → Shortlisted → Interview Scheduled → Offer Extended → Accepted/Rejected.
+    """
+    job_posting = models.ForeignKey(JobPosting, on_delete=models.CASCADE, related_name='applications')
+    job_role = models.ForeignKey(
+        JobRole, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='applications',
+        help_text="Specific role applied for within the posting (optional)"
+    )
+    student = models.ForeignKey(Student, on_delete=models.CASCADE, related_name='job_applications')
+    status = models.CharField(
+        max_length=30,
+        choices=Constants.APPLICATION_STATUS,
+        default='APPLIED'
+    )
+    applied_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    # Legacy file upload (kept for backward compatibility, no longer populated)
+    resume_link = models.FileField(
+        upload_to='documents/placement/resumes/', null=True, blank=True
+    )
+    # New: external resume URL submitted with the application
+    resume_url = models.URLField(
+        max_length=1000, blank=True, null=True,
+        help_text="External resume URL chosen at apply time"
+    )
+    selected_resume = models.ForeignKey(
+        StudentResume, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='applications',
+        help_text="StudentResume selected from profile at apply time"
+    )
+    # Snapshot of the student's contact details at the time of application.
+    # These are auto-populated from the PlacementProfile when applying so the
+    # TPO/recruiter sees a stable record even if the student later changes
+    # their profile.
+    applicant_email = models.EmailField(
+        max_length=254, blank=True, null=True,
+        help_text="Professional email captured from PlacementProfile at apply time"
+    )
+    applicant_linkedin = models.URLField(
+        max_length=500, blank=True, null=True,
+        help_text="LinkedIn URL captured from PlacementProfile at apply time"
+    )
+    applicant_github = models.URLField(
+        max_length=500, blank=True, null=True,
+        help_text="GitHub URL captured from PlacementProfile at apply time"
+    )
+    remarks = models.TextField(max_length=500, blank=True, null=True,
+                               help_text="Remarks by TPO or Company")
+
+    class Meta:
+        unique_together = (('job_posting', 'student'),)
+        ordering = ['-applied_at']
+
+    def __str__(self):
+        return '{} applied for {} at {}'.format(
+            self.student.id.user.username,
+            self.job_posting.title,
+            self.job_posting.company.name
+        )
+
+
+class JobApplicationResponse(models.Model):
+    """
+    Stores a student's response to a single dynamic form field on a job
+    application. Values are stored as JSON to support text, number, and
+    single/multi-choice answers in a uniform way.
+    """
+    application = models.ForeignKey(
+        JobApplication, on_delete=models.CASCADE, related_name='responses'
+    )
+    field = models.ForeignKey(
+        JobFormField, on_delete=models.CASCADE, related_name='responses'
+    )
+    # JSON value:
+    #   SHORT_ANSWER / LONG_ANSWER -> str
+    #   NUMBER -> float
+    #   SINGLE_CHOICE -> str (option label/value)
+    #   MULTI_CHOICE -> list of str
+    value = models.JSONField(default=dict, blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = (('application', 'field'),)
+
+    def __str__(self):
+        return '{} -> {}'.format(self.application_id, self.field.label)
+
+
+class InterviewSchedule(models.Model):
+    """
+    Tracks interview schedules for shortlisted students for a job posting.
+    Includes conflict detection via date/time_slot/end_time/venue and
+    reschedule tracking (max 2 reschedules enforced at the API layer).
+    """
+    job_posting = models.ForeignKey(JobPosting, on_delete=models.CASCADE, related_name='interviews')
+    date = models.DateField()
+    time_slot = models.TimeField()
+    duration_minutes = models.PositiveIntegerField(
+        default=60,
+        help_text="Duration of the interview slot in minutes"
+    )
+    end_time = models.TimeField(
+        null=True, blank=True,
+        help_text="Auto-computed from time_slot + duration_minutes"
+    )
+    mode = models.CharField(max_length=10, choices=Constants.INTERVIEW_MODE, default='OFFLINE')
+    venue_or_link = models.CharField(
+        max_length=500, blank=True, null=True,
+        help_text="Physical venue or online meeting link"
+    )
+    description = models.TextField(max_length=1000, blank=True, null=True)
+    round_number = models.PositiveIntegerField(
+        default=1,
+        help_text="Interview round number (1, 2, 3...)"
+    )
+    reschedule_count = models.PositiveIntegerField(
+        default=0,
+        help_text="Number of times this interview has been rescheduled (max 2)"
+    )
+    created_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='created_interviews'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['date', 'time_slot']
+
+    def save(self, *args, **kwargs):
+        """Auto-compute end_time from time_slot + duration_minutes."""
+        if self.time_slot and self.duration_minutes:
+            start_dt = datetime.datetime.combine(datetime.date.today(), self.time_slot)
+            end_dt = start_dt + datetime.timedelta(minutes=self.duration_minutes)
+            self.end_time = end_dt.time()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return 'Interview for {} on {} (Round {})'.format(
+            self.job_posting.title, self.date, self.round_number
+        )
+
+
+class InterviewPanel(models.Model):
+    """
+    Links shortlisted students to a specific interview schedule.
+    """
+    interview = models.ForeignKey(InterviewSchedule, on_delete=models.CASCADE, related_name='panelists')
+    application = models.ForeignKey(JobApplication, on_delete=models.CASCADE, related_name='interview_panels')
+    remarks = models.TextField(max_length=500, blank=True, null=True)
+    result = models.CharField(
+        max_length=20,
+        choices=Constants.INTERVIEW_RESULT,
+        default='PENDING',
+        help_text="PENDING / SELECTED / REJECTED / WAITLISTED"
+    )
+
+    class Meta:
+        unique_together = (('interview', 'application'),)
+
+    def __str__(self):
+        return '{} - {}'.format(self.application.student.id.user.username, self.interview)
+
+
+class JobOffer(models.Model):
+    """
+    Represents a job offer extended by a company to a student through the placement system.
+    Students must accept/reject within a deadline.
+    """
+    application = models.OneToOneField(JobApplication, on_delete=models.CASCADE, related_name='offer')
+    ctc_offered = models.DecimalField(decimal_places=2, max_digits=10)
+    designation_offered = models.CharField(max_length=200, blank=True, null=True)
+    joining_date = models.DateField(null=True, blank=True)
+    offer_letter = models.FileField(
+        upload_to='documents/placement/offer_letters/', null=True, blank=True
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=Constants.OFFER_STATUS,
+        default='PENDING'
+    )
+    response_deadline = models.DateTimeField(
+        help_text="Deadline for student to accept/reject"
+    )
+    extended_at = models.DateTimeField(auto_now_add=True)
+    responded_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-extended_at']
+
+    def __str__(self):
+        return 'Offer to {} from {}'.format(
+            self.application.student.id.user.username,
+            self.application.job_posting.company.name
+        )
+
+    @property
+    def is_deadline_passed(self):
+        return timezone.now() > self.response_deadline and self.status == 'PENDING'
+
+
+class Announcement(models.Model):
+    """
+    Official announcements by TPO or Placement Chairman related to placement activities.
+    """
+    title = models.CharField(max_length=200)
+    content = models.TextField(max_length=3000)
+    announcement_type = models.CharField(
+        max_length=30,
+        choices=Constants.ANNOUNCEMENT_TYPE,
+        default='GENERAL'
+    )
+    notice_type = models.CharField(
+        max_length=20,
+        choices=Constants.NOTICE_TYPE,
+        default='GENERAL',
+    )
+    priority = models.CharField(
+        max_length=10,
+        choices=Constants.NOTICE_PRIORITY,
+        default='NORMAL',
+    )
+    visibility_scope = models.CharField(
+        max_length=20,
+        choices=Constants.NOTICE_VISIBILITY_SCOPE,
+        default='ALL',
+    )
+    visibility_targets = models.CharField(
+        max_length=200,
+        blank=True,
+        null=True,
+        help_text="Comma-separated targets when visibility_scope is SPECIFIC_BATCH",
+    )
+    target_audience = models.CharField(
+        max_length=200, blank=True, null=True,
+        help_text="Comma-separated: ALL,B.Tech,M.Tech,CSE,ECE etc."
+    )
+    # Legacy file upload field — kept for backward compatibility but no longer
+    # populated from the UI. New noticeboard posts attach an external link.
+    attached_file = models.FileField(
+        upload_to='documents/placement/announcements/', null=True, blank=True
+    )
+    attachment_link = models.URLField(
+        max_length=1000, blank=True, null=True,
+        help_text="Optional external link attached to the notice "
+                  "(Drive, JD, registration form, etc.)"
+    )
+    attachment_label = models.CharField(
+        max_length=120, blank=True, null=True,
+        help_text="Optional display label for the attachment link "
+                  "(e.g. 'Registration form')"
+    )
+    created_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='placement_announcements'
+    )
+    is_active = models.BooleanField(default=True)
+    publish_at = models.DateTimeField(default=timezone.now)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return self.title
+
+
+class PlacementPolicy(models.Model):
+    """
+    Configurable placement policies enforced by the system.
+    E.g., max number of offers, dream company rules, etc.
+    """
+    name = models.CharField(max_length=200, unique=True)
+    description = models.TextField(max_length=1000, blank=True, null=True)
+    max_offers_allowed = models.IntegerField(
+        default=1,
+        help_text="Maximum active offers a student can hold at a time"
+    )
+    allow_dream_company = models.BooleanField(
+        default=False,
+        help_text="Allow students to apply to dream companies after being placed"
+    )
+    dream_ctc_threshold = models.DecimalField(
+        decimal_places=2, max_digits=10, default=0,
+        help_text="Minimum CTC (LPA) for dream company classification"
+    )
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name_plural = "Placement Policies"
+
+    def __str__(self):
+        return self.name
+
+class Appeal(models.Model):
+    """
+    Appeals by students against placement decisions (e.g., interview rejections).
+    """
+    application = models.ForeignKey(JobApplication, on_delete=models.CASCADE, related_name='appeals')
+    reason = models.TextField(max_length=2000, help_text="Reason for the appeal")
+    status = models.CharField(
+        max_length=20,
+        choices=(('PENDING', 'Pending'), ('RESOLVED', 'Resolved'), ('REJECTED', 'Rejected')),
+        default='PENDING'
+    )
+    remarks = models.TextField(max_length=2000, blank=True, null=True, help_text="TPO remarks on resolution")
+    created_at = models.DateTimeField(auto_now_add=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return 'Appeal by {} for {} ({})'.format(
+            self.application.student.id.user.username,
+            self.application.job_posting.company.name,
+            self.status
+        )
+
+class PlacementProfile(models.Model):
+    student = models.OneToOneField(Student, on_delete=models.CASCADE, related_name='placement_profile')
+    # Legacy file upload retained for backward compatibility but no longer
+    # populated/edited from the UI (resumes are managed via StudentResume).
+    resume = models.FileField(upload_to='placement_resumes/', blank=True, null=True)
+    about_me = models.TextField(blank=True, null=True)
+    linkedin_url = models.URLField(max_length=500, blank=True, null=True)
+    github_url = models.URLField(max_length=500, blank=True, null=True)
+    portfolio_url = models.URLField(max_length=500, blank=True, null=True)
+    professional_email = models.EmailField(
+        max_length=254, blank=True, null=True,
+        help_text="Preferred contact email used in placement applications."
+    )
+    achievements = models.JSONField(default=list, blank=True, null=True)
+    certifications = models.JSONField(default=list, blank=True, null=True)
+    # When True, the TPO has explicitly granted this student the right to
+    # continue applying despite already being placed/interned (e.g. a
+    # "dream company" exception). Only the TPO/Chairman can toggle this.
+    apply_override = models.BooleanField(
+        default=False,
+        help_text="If true, the student may apply even after being marked placed."
+    )
+    apply_override_remarks = models.TextField(
+        max_length=500, blank=True, null=True,
+        help_text="Reason recorded by TPO when granting an apply override."
+    )
+
+    def __str__(self):
+        return f"{self.student.id.user.username}'s Placement Profile"
+
+    @property
+    def is_complete(self):
+        """Profile is complete enough to apply when the contact essentials are set."""
+        return bool(
+            self.professional_email
+            and self.linkedin_url
+            and self.github_url
+        )
+
+    def missing_required_fields(self):
+        """Return a list of required-for-apply fields that are still empty."""
+        missing = []
+        if not self.professional_email:
+            missing.append('professional_email')
+        if not self.linkedin_url:
+            missing.append('linkedin_url')
+        if not self.github_url:
+            missing.append('github_url')
+        return missing
+
+
+class PlacementProfileAuditLog(models.Model):
+    profile = models.ForeignKey(PlacementProfile, on_delete=models.CASCADE, related_name='audit_logs')
+    changed_at = models.DateTimeField(auto_now_add=True)
+    changed_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
+    changes = models.JSONField()
+
+    def __str__(self):
+        return f"Log for {self.profile} at {self.changed_at}"
+
+
+# =============================================
+# ALUMNI NETWORK MODELS
+# =============================================
+
+class AlumniProfile(models.Model):
+    """
+    Represents an alumni who has registered on the placement system.
+    Alumni self-register and are subject to TPO approval before they
+    can access mentorship and job-referral features.
+    """
+    APPROVAL_CHOICES = (
+        ('PENDING', 'Pending'),
+        ('APPROVED', 'Approved'),
+        ('REJECTED', 'Rejected'),
+    )
+
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='alumni_profile')
+    graduation_year = models.IntegerField(help_text="Year of graduation")
+    programme = models.CharField(max_length=50, blank=True, null=True,
+                                 help_text="e.g. B.Tech, M.Tech, B.Des, PhD")
+    department = models.CharField(max_length=100, blank=True, null=True,
+                                  help_text="Department at the time of graduation")
+    current_company = models.CharField(max_length=200, blank=True, null=True)
+    current_designation = models.CharField(max_length=200, blank=True, null=True)
+    linkedin_url = models.URLField(max_length=500, blank=True, null=True)
+    phone = models.CharField(max_length=20, blank=True, null=True)
+    bio = models.TextField(max_length=2000, blank=True, null=True)
+    verification_document = models.FileField(
+        upload_to='placement/alumni_verification/', blank=True, null=True,
+        help_text="Upload degree certificate or ID for verification"
+    )
+    approval_status = models.CharField(
+        max_length=20, choices=APPROVAL_CHOICES, default='PENDING'
+    )
+    approved_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='approved_alumni'
+    )
+    rejection_remarks = models.TextField(max_length=1000, blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name_plural = "Alumni Profiles"
+
+    def __str__(self):
+        return f"{self.user.first_name} {self.user.last_name} ({self.graduation_year})"
+
+    @property
+    def full_name(self):
+        return f"{self.user.first_name} {self.user.last_name}".strip()
+
+    @property
+    def is_approved(self):
+        return self.approval_status == 'APPROVED'
+
+
+class MentorshipProfile(models.Model):
+    """
+    An approved alumni can set up a mentorship profile to offer
+    guidance to current students.
+    """
+    alumni = models.OneToOneField(
+        AlumniProfile, on_delete=models.CASCADE, related_name='mentorship_profile'
+    )
+    is_available = models.BooleanField(default=True)
+    topics = models.JSONField(
+        default=list, blank=True,
+        help_text="List of topics the mentor can help with, e.g. ['Resume Review', 'DSA', 'System Design']"
+    )
+    availability_slots = models.JSONField(
+        default=list, blank=True,
+        help_text="Preferred time-slots, e.g. [{'day':'Monday','time':'18:00-19:00'}]"
+    )
+    max_sessions_per_month = models.IntegerField(default=4)
+    bio = models.TextField(max_length=1000, blank=True, null=True,
+                           help_text="Short mentorship-specific bio / what you can help with")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-updated_at']
+
+    def __str__(self):
+        return f"Mentor: {self.alumni.full_name}"
+
+
+class MentorshipSession(models.Model):
+    """
+    Tracks a mentorship session booked between a student and an alumni mentor.
+    """
+    SESSION_STATUS = (
+        ('REQUESTED', 'Requested'),
+        ('CONFIRMED', 'Confirmed'),
+        ('COMPLETED', 'Completed'),
+        ('CANCELLED', 'Cancelled'),
+    )
+
+    mentor = models.ForeignKey(
+        MentorshipProfile, on_delete=models.CASCADE, related_name='sessions'
+    )
+    student = models.ForeignKey(
+        Student, on_delete=models.CASCADE, related_name='mentorship_sessions'
+    )
+    topic = models.CharField(max_length=200)
+    message = models.TextField(max_length=1000, blank=True, null=True,
+                               help_text="Student's message to the mentor")
+    scheduled_date = models.DateField(null=True, blank=True)
+    scheduled_time = models.TimeField(null=True, blank=True)
+    duration_minutes = models.IntegerField(default=30)
+    meeting_link = models.URLField(max_length=500, blank=True, null=True)
+    status = models.CharField(max_length=20, choices=SESSION_STATUS, default='REQUESTED')
+    mentor_notes = models.TextField(max_length=1000, blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Session: {self.student.id.user.username} ↔ {self.mentor.alumni.full_name} ({self.status})"
+
+
+class JobReferral(models.Model):
+    """
+    Alumni can post job referral opportunities for current students.
+    """
+    posted_by = models.ForeignKey(
+        AlumniProfile, on_delete=models.CASCADE, related_name='referrals'
+    )
+    company_name = models.CharField(max_length=200)
+    role_title = models.CharField(max_length=200)
+    description = models.TextField(max_length=3000)
+    location = models.CharField(max_length=200, blank=True, null=True)
+    referral_link = models.URLField(max_length=500, blank=True, null=True,
+                                    help_text="Application / referral link")
+    ctc_range = models.CharField(max_length=100, blank=True, null=True,
+                                 help_text="e.g. 12-18 LPA")
+    eligible_programmes = models.CharField(
+        max_length=200, blank=True, null=True,
+        help_text="Comma-separated: B.Tech, M.Tech, B.Des, PhD"
+    )
+    eligible_branches = models.CharField(
+        max_length=300, blank=True, null=True,
+        help_text="Comma-separated: CSE, ECE, ME, DESIGN"
+    )
+    is_active = models.BooleanField(default=True)
+    deadline = models.DateField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.role_title} at {self.company_name} (by {self.posted_by.full_name})"
+
+    @property
+    def is_deadline_passed(self):
+        if self.deadline:
+            return datetime.date.today() > self.deadline
+        return False
+
+
+# =============================================
+# PLACEMENT STATUS MANAGEMENT
+# =============================================
+
+class PlacementClaim(models.Model):
+    """
+    A student's self-reported placement / internship outcome, awaiting (or
+    completed) verification by the TPO.
+
+    Only the TPO / Placement Chairman may verify claims. Any student that
+    has at least one VERIFIED claim of a given kind (PLACEMENT or
+    INTERNSHIP) is considered "placed" / "interning" for that kind, and is
+    blocked from new applications of the same kind unless the TPO grants
+    them an override on their PlacementProfile.
+
+    The TPO may also create claims directly for a student (e.g. when they
+    learn of an off-campus placement) and they will be saved with status
+    VERIFIED.
+    """
+
+    KIND_PLACEMENT = 'PLACEMENT'
+    KIND_INTERNSHIP = 'INTERNSHIP'
+    KIND_CHOICES = (
+        (KIND_PLACEMENT, 'Placement'),
+        (KIND_INTERNSHIP, 'Internship'),
+    )
+
+    SOURCE_OFFCAMPUS = 'OFFCAMPUS'
+    SOURCE_ONCAMPUS = 'ONCAMPUS'
+    SOURCE_REFERRAL = 'REFERRAL'
+    SOURCE_OTHER = 'OTHER'
+    SOURCE_CHOICES = (
+        (SOURCE_OFFCAMPUS, 'Off-campus'),
+        (SOURCE_ONCAMPUS, 'On-campus / Through PCMS'),
+        (SOURCE_REFERRAL, 'Referral'),
+        (SOURCE_OTHER, 'Other'),
+    )
+
+    STATUS_PENDING = 'PENDING'
+    STATUS_VERIFIED = 'VERIFIED'
+    STATUS_REJECTED = 'REJECTED'
+    STATUS_CHOICES = (
+        (STATUS_PENDING, 'Pending verification'),
+        (STATUS_VERIFIED, 'Verified'),
+        (STATUS_REJECTED, 'Rejected'),
+    )
+
+    student = models.ForeignKey(
+        Student, on_delete=models.CASCADE, related_name='placement_claims'
+    )
+    kind = models.CharField(max_length=20, choices=KIND_CHOICES)
+    company_name = models.CharField(max_length=200)
+    role_title = models.CharField(max_length=200, blank=True, null=True)
+    location = models.CharField(max_length=200, blank=True, null=True)
+    # Compensation is interpreted exactly like JobPosting: LPA for full-time
+    # placements, monthly stipend for internships.
+    compensation_amount = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True,
+        help_text="LPA for placements, ₹/month for internships"
+    )
+    duration_months = models.PositiveSmallIntegerField(
+        null=True, blank=True,
+        help_text="Internship duration in months (only used when kind=INTERNSHIP)"
+    )
+    start_date = models.DateField(null=True, blank=True)
+    end_date = models.DateField(null=True, blank=True)
+    source = models.CharField(
+        max_length=20, choices=SOURCE_CHOICES, default=SOURCE_OFFCAMPUS
+    )
+    proof_link = models.URLField(
+        max_length=1000, blank=True, null=True,
+        help_text="Optional link to offer letter / mail screenshot"
+    )
+    notes = models.TextField(max_length=1000, blank=True, null=True)
+
+    status = models.CharField(
+        max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING
+    )
+    created_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='created_placement_claims',
+        help_text="The user who originally submitted this claim "
+                  "(student or TPO)."
+    )
+    verified_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='verified_placement_claims'
+    )
+    verification_remarks = models.TextField(
+        max_length=1000, blank=True, null=True
+    )
+    verified_at = models.DateTimeField(null=True, blank=True)
+    related_offer = models.ForeignKey(
+        JobOffer, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='placement_claims',
+        help_text="Set automatically when the claim originates from an "
+                  "accepted JobOffer."
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return '{} ({}) - {} [{}]'.format(
+            self.student.id.user.username,
+            self.kind,
+            self.company_name,
+            self.status,
+        )
+
+    @property
+    def is_verified(self):
+        return self.status == self.STATUS_VERIFIED
